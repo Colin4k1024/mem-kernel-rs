@@ -1,0 +1,15 @@
+[package]
+name = "mem-scheduler"
+version = "0.1.0"
+edition = "2021"
+description = "Async add scheduler: queue + worker + job status (MemOS-compatible)"
+
+[dependencies]
+mem-types = { path = "../mem-types" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync"] }
+uuid = { version = "1.0", features = ["v4"] }
+chrono = "0.4"
+tracing = "0.1"
+serde_json = "1.0"
+thiserror = "1.0"

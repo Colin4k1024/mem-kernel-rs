@@ -166,6 +166,54 @@ pub struct SearchResponse {
     pub data: Option<SearchResponseData>,
 }
 
+/// Request to update an existing memory (partial fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateMemoryRequest {
+    pub memory_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub mem_cube_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Request to forget (soft or hard delete) a memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgetMemoryRequest {
+    pub memory_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub mem_cube_id: Option<String>,
+    /// If true, soft delete (mark tombstone); else hard delete.
+    #[serde(default)]
+    pub soft: bool,
+}
+
+/// Response for update_memory / forget_memory (same envelope as add).
+pub type UpdateMemoryResponse = BaseResponse<Vec<serde_json::Value>>;
+pub type ForgetMemoryResponse = BaseResponse<Vec<serde_json::Value>>;
+
+/// Request to get a single memory by id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetMemoryRequest {
+    pub memory_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub mem_cube_id: Option<String>,
+}
+
+/// Response for get_memory: optional MemoryItem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetMemoryResponse {
+    #[serde(default = "default_code")]
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<MemoryItem>,
+}
+
 /// Internal memory node (id, memory, metadata, optional embedding).
 #[derive(Debug, Clone)]
 pub struct MemoryNode {

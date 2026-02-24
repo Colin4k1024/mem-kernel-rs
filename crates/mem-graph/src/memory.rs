@@ -180,6 +180,40 @@ impl GraphStore for InMemoryGraphStore {
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(nodes)
     }
+
+    async fn update_node(
+        &self,
+        id: &str,
+        fields: &HashMap<String, serde_json::Value>,
+        _user_name: Option<&str>,
+    ) -> Result<(), GraphStoreError> {
+        let mut guard = self.nodes.write().await;
+        let node = guard
+            .get_mut(id)
+            .ok_or_else(|| GraphStoreError::Other(format!("node not found: {}", id)))?;
+        for (k, v) in fields {
+            if k == "memory" {
+                node.memory = v.as_str().unwrap_or("").to_string();
+            } else {
+                node.metadata.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_node(&self, id: &str) -> Result<(), GraphStoreError> {
+        let mut nodes = self.nodes.write().await;
+        nodes.remove(id).ok_or_else(|| {
+            GraphStoreError::Other(format!("node not found: {}", id))
+        })?;
+        let mut idx = self.scope_index.write().await;
+        for scope_map in idx.values_mut() {
+            for list in scope_map.values_mut() {
+                list.retain(|x| x != id);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {

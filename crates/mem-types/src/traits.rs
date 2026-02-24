@@ -1,6 +1,10 @@
 //! Traits for MemCube and storage backends.
 
-use crate::{ApiAddRequest, ApiSearchRequest, MemoryNode, MemoryResponse, SearchResponse};
+use crate::{
+    ApiAddRequest, ApiSearchRequest, ForgetMemoryRequest, ForgetMemoryResponse, GetMemoryRequest,
+    GetMemoryResponse, MemoryNode, MemoryResponse, SearchResponse, UpdateMemoryRequest,
+    UpdateMemoryResponse,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
@@ -59,6 +63,17 @@ pub trait GraphStore: Send + Sync {
         user_name: &str,
         include_embedding: bool,
     ) -> Result<Vec<MemoryNode>, GraphStoreError>;
+
+    /// Update fields of an existing node (memory and/or metadata).
+    async fn update_node(
+        &self,
+        id: &str,
+        fields: &HashMap<String, serde_json::Value>,
+        user_name: Option<&str>,
+    ) -> Result<(), GraphStoreError>;
+
+    /// Delete a node (hard delete; removes from graph and scope index).
+    async fn delete_node(&self, id: &str) -> Result<(), GraphStoreError>;
 }
 
 /// Vector store abstraction (subset of MemOS BaseVecDB).
@@ -112,7 +127,7 @@ pub trait Embedder: Send + Sync {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError>;
 }
 
-/// MemCube abstraction: add and search memories.
+/// MemCube abstraction: add, search, update, and forget memories.
 #[async_trait]
 pub trait MemCube: Send + Sync {
     /// Add memories from request; returns MemoryResponse.
@@ -120,6 +135,21 @@ pub trait MemCube: Send + Sync {
 
     /// Search memories from request; returns SearchResponse.
     async fn search_memories(&self, req: &ApiSearchRequest) -> Result<SearchResponse, MemCubeError>;
+
+    /// Update an existing memory (partial fields); re-embeds if memory text changed.
+    async fn update_memory(
+        &self,
+        req: &UpdateMemoryRequest,
+    ) -> Result<UpdateMemoryResponse, MemCubeError>;
+
+    /// Forget (soft or hard delete) a memory.
+    async fn forget_memory(
+        &self,
+        req: &ForgetMemoryRequest,
+    ) -> Result<ForgetMemoryResponse, MemCubeError>;
+
+    /// Get a single memory by id (within user/cube scope).
+    async fn get_memory(&self, req: &GetMemoryRequest) -> Result<GetMemoryResponse, MemCubeError>;
 }
 
 #[derive(Debug, thiserror::Error)]

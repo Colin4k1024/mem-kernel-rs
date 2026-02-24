@@ -12,8 +12,9 @@ path = "src/main.rs"
 mem-types = { path = "../mem-types" }
 mem-cube = { path = "../mem-cube" }
 mem-graph = { path = "../mem-graph" }
-mem-vec = { path = "../mem-vec" }
+mem-vec = { path = "../mem-vec", features = ["qdrant"] }
 mem-embed = { path = "../mem-embed" }
+mem-scheduler = { path = "../mem-scheduler" }
 axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
@@ -21,3 +22,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }

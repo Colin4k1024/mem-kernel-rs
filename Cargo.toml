@@ -6,5 +6,6 @@ members = [
     "crates/mem-vec",
     "crates/mem-embed",
     "crates/mem-cube",
+    "crates/mem-scheduler",
     "crates/mem-api",
 ]

@@ -13,7 +13,7 @@ Rust implementation of [MemOS](https://github.com/MemTensor/MemOS)-compatible me
 
 ## Run the API
 
-Default: in-memory graph and vector store, no Qdrant. Set embedding API for add/search:
+Default: in-memory graph and vector store. Set embedding API for add/search:
 
 ```bash
 export EMBED_API_URL=https://api.openai.com/v1/embeddings   # or any OpenAI-compatible URL
@@ -23,21 +23,21 @@ export MEMOS_LISTEN=0.0.0.0:8001   # optional, default 8001
 cargo run --bin mem-api
 ```
 
+To use **Qdrant** as the vector backend (persistent), set `QDRANT_URL` (and optionally `QDRANT_COLLECTION`). The binary will choose the store at startup:
+
+```bash
+export QDRANT_URL=http://localhost:6334
+cargo run --bin mem-api
+```
+
+**Multi-tenant / namespace:** All storage is isolated by `user_id` and `mem_cube_id` (or `writable_cube_ids` / `readable_cube_ids`). Use the same identifiers in add and search for a given user/cube.
+
 Then:
 
 - **Add:** `POST http://localhost:8001/product/add` with JSON body like MemOS, e.g. `{"user_id":"u1","mem_cube_id":"u1","messages":[{"role":"user","content":"I like strawberry"}],"async_mode":"sync"}`.
 - **Search:** `POST http://localhost:8001/product/search` with `{"query":"What do I like","user_id":"u1","mem_cube_id":"u1","top_k":10}`.
 
 Request/response shapes match MemOS so existing clients can target this service.
-
-## Build with Qdrant
-
-To use Qdrant as the vector backend (e.g. for persistence):
-
-```bash
-cargo build -p mem-vec --features qdrant
-# Then wire QdrantVecStore in your app (mem-api binary currently uses InMemoryVecStore).
-```
 
 ## License
 

@@ -171,4 +171,146 @@ where
             }),
         })
     }
+
+    async fn update_memory(
+        &self,
+        req: &UpdateMemoryRequest,
+    ) -> Result<UpdateMemoryResponse, MemCubeError> {
+        let user_name = req
+            .mem_cube_id
+            .as_deref()
+            .unwrap_or(req.user_id.as_str());
+        let id = &req.memory_id;
+
+        let mut fields = HashMap::new();
+        if let Some(ref memory) = req.memory {
+            fields.insert("memory".to_string(), serde_json::Value::String(memory.clone()));
+        }
+        if let Some(ref meta) = req.metadata {
+            for (k, v) in meta {
+                fields.insert(k.clone(), v.clone());
+            }
+        }
+        fields.insert(
+            "updated_at".to_string(),
+            serde_json::Value::String(Utc::now().to_rfc3339()),
+        );
+
+        if fields.len() > 1 || req.memory.is_some() {
+            self.graph
+                .update_node(id, &fields, Some(user_name))
+                .await
+                .map_err(MemCubeError::Graph)?;
+        }
+
+        if let Some(ref new_memory) = req.memory {
+            let embedding = self.embedder.embed(new_memory).await?;
+            self.vec_store.delete(&[id.to_string()], None).await.map_err(MemCubeError::Vec)?;
+            let payload = {
+                let mut p = HashMap::new();
+                p.insert(
+                    "mem_cube_id".to_string(),
+                    serde_json::Value::String(user_name.to_string()),
+                );
+                p.insert(
+                    "memory_type".to_string(),
+                    serde_json::Value::String("text_mem".to_string()),
+                );
+                p
+            };
+            let item = VecStoreItem {
+                id: id.to_string(),
+                vector: embedding,
+                payload,
+            };
+            self.vec_store.add(&[item], None).await.map_err(MemCubeError::Vec)?;
+        }
+
+        let data = vec![serde_json::json!({ "id": id, "updated": true })];
+        Ok(UpdateMemoryResponse {
+            code: 200,
+            message: "Memory updated successfully".to_string(),
+            data: Some(data),
+        })
+    }
+
+    async fn forget_memory(
+        &self,
+        req: &ForgetMemoryRequest,
+    ) -> Result<ForgetMemoryResponse, MemCubeError> {
+        let id = &req.memory_id;
+        if req.soft {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "state".to_string(),
+                serde_json::Value::String("tombstone".to_string()),
+            );
+            fields.insert(
+                "updated_at".to_string(),
+                serde_json::Value::String(Utc::now().to_rfc3339()),
+            );
+            let user_name = req
+                .mem_cube_id
+                .as_deref()
+                .unwrap_or(req.user_id.as_str());
+            self.graph
+                .update_node(id, &fields, Some(user_name))
+                .await
+                .map_err(MemCubeError::Graph)?;
+            self.vec_store.delete(&[id.to_string()], None).await.map_err(MemCubeError::Vec)?;
+        } else {
+            self.graph.delete_node(id).await.map_err(MemCubeError::Graph)?;
+            self.vec_store.delete(&[id.to_string()], None).await.map_err(MemCubeError::Vec)?;
+        }
+        let data = vec![serde_json::json!({ "id": id, "forgotten": true })];
+        Ok(ForgetMemoryResponse {
+            code: 200,
+            message: "Memory forgotten successfully".to_string(),
+            data: Some(data),
+        })
+    }
+
+    async fn get_memory(&self, req: &GetMemoryRequest) -> Result<GetMemoryResponse, MemCubeError> {
+        let user_name = req
+            .mem_cube_id
+            .as_deref()
+            .unwrap_or(req.user_id.as_str());
+        let node_opt = self
+            .graph
+            .get_node(&req.memory_id, false)
+            .await
+            .map_err(MemCubeError::Graph)?;
+        let node = match node_opt {
+            Some(n) => n,
+            None => {
+                return Ok(GetMemoryResponse {
+                    code: 404,
+                    message: "Memory not found".to_string(),
+                    data: None,
+                });
+            }
+        };
+        let node_user = node
+            .metadata
+            .get("user_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if node_user != user_name {
+            return Ok(GetMemoryResponse {
+                code: 404,
+                message: "Memory not found".to_string(),
+                data: None,
+            });
+        }
+        let item = MemoryItem {
+            id: node.id,
+            memory: node.memory,
+            metadata: node.metadata,
+        };
+        Ok(GetMemoryResponse {
+            code: 200,
+            message: "Success".to_string(),
+            data: Some(item),
+        })
+    }
 }
