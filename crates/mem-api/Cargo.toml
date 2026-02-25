@@ -17,7 +17,7 @@ mem-vec = { path = "../mem-vec", features = ["qdrant"] }
 mem-embed = { path = "../mem-embed" }
 mem-scheduler = { path = "../mem-scheduler" }
 async-trait = "0.1"
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1.0", features = ["derive"] }
