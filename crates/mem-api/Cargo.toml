@@ -29,5 +29,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 mem-embed = { path = "../mem-embed", features = ["test-util"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
