@@ -47,6 +47,44 @@ where
             None => Ok(0),
         }
     }
+
+    fn normalize_scope(scope: &str) -> Option<&'static str> {
+        let normalized = scope
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-', '_'], "");
+        match normalized.as_str() {
+            "workingmemory" | "working" | "shortterm" | "shorttermmemory" | "stm" | "recent" => {
+                Some(MemoryScope::WorkingMemory.as_str())
+            }
+            "usermemory" | "user" | "midterm" | "midtermmemory" | "profile" | "preference" => {
+                Some(MemoryScope::UserMemory.as_str())
+            }
+            "longtermmemory" | "longterm" | "ltm" => Some(MemoryScope::LongTermMemory.as_str()),
+            _ => None,
+        }
+    }
+
+    fn resolve_scope(req: &ApiAddRequest, default_scope: &str) -> String {
+        let from_info = req.info.as_ref().and_then(|info| {
+            info.get("scope")
+                .or_else(|| info.get("memory_scope"))
+                .and_then(|v| v.as_str())
+        });
+        from_info
+            .and_then(Self::normalize_scope)
+            .unwrap_or(default_scope)
+            .to_string()
+    }
+
+    fn bucket_name_for_scope(scope: &str) -> Option<&'static str> {
+        match scope {
+            "WorkingMemory" => Some("short_term"),
+            "UserMemory" => Some("mid_term"),
+            "LongTermMemory" => Some("long_term"),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -62,18 +100,46 @@ where
         })?;
         let cube_ids = req.writable_cube_ids();
         let user_name = cube_ids.first().map(String::as_str).unwrap_or(&req.user_id);
+        let scope = Self::resolve_scope(req, &self.default_scope);
 
         let id = Uuid::new_v4().to_string();
         let embedding = self.embedder.embed(&content).await?;
         let mut metadata = HashMap::new();
         metadata.insert(
             "scope".to_string(),
-            serde_json::Value::String(self.default_scope.clone()),
+            serde_json::Value::String(scope.clone()),
         );
         metadata.insert(
             "created_at".to_string(),
             serde_json::Value::String(Utc::now().to_rfc3339()),
         );
+        if let Some(ref session_id) = req.session_id {
+            metadata.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.clone()),
+            );
+        }
+        if let Some(ref task_id) = req.task_id {
+            metadata.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.clone()),
+            );
+        }
+        if let Some(ref custom_tags) = req.custom_tags {
+            metadata.insert("custom_tags".to_string(), serde_json::json!(custom_tags));
+        }
+        if let Some(ref chat_history) = req.chat_history {
+            metadata.insert("chat_history".to_string(), serde_json::json!(chat_history));
+        }
+        if let Some(ref info) = req.info {
+            for (k, v) in info {
+                metadata.insert(k.clone(), v.clone());
+            }
+            metadata.insert(
+                "scope".to_string(),
+                serde_json::Value::String(scope.clone()),
+            );
+        }
 
         let node = MemoryNode {
             id: id.clone(),
@@ -132,11 +198,7 @@ where
                         }
                     }
                 }
-                if let Err(e) = self
-                    .graph
-                    .add_edges_batch(&edges, Some(user_name))
-                    .await
-                {
+                if let Err(e) = self.graph.add_edges_batch(&edges, Some(user_name)).await {
                     // Keep add operation atomic-ish for graph writes.
                     let _ = self.graph.delete_node(&id, Some(user_name)).await;
                     return Err(MemCubeError::Graph(e));
@@ -154,6 +216,7 @@ where
                 "memory_type".to_string(),
                 serde_json::Value::String("text_mem".to_string()),
             );
+            p.insert("scope".to_string(), serde_json::Value::String(scope));
             p
         };
         let item = VecStoreItem {
@@ -208,6 +271,7 @@ where
                 message: "Search completed successfully".to_string(),
                 data: Some(SearchResponseData {
                     text_mem: vec![MemoryBucket {
+                        name: Some("all".to_string()),
                         memories: vec![],
                         total_nodes: Some(0),
                     }],
@@ -250,15 +314,42 @@ where
             })
             .collect();
 
-        let bucket = MemoryBucket {
+        let all_bucket = MemoryBucket {
+            name: Some("all".to_string()),
             total_nodes: Some(memories.len()),
-            memories,
+            memories: memories.clone(),
         };
+        let mut text_mem = vec![all_bucket];
+        for scope in [
+            MemoryScope::WorkingMemory.as_str(),
+            MemoryScope::UserMemory.as_str(),
+            MemoryScope::LongTermMemory.as_str(),
+        ] {
+            let scoped: Vec<MemoryItem> = memories
+                .iter()
+                .filter(|m| {
+                    m.metadata
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == scope)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if scoped.is_empty() {
+                continue;
+            }
+            text_mem.push(MemoryBucket {
+                name: Self::bucket_name_for_scope(scope).map(str::to_string),
+                total_nodes: Some(scoped.len()),
+                memories: scoped,
+            });
+        }
         Ok(SearchResponse {
             code: 200,
             message: "Search completed successfully".to_string(),
             data: Some(SearchResponseData {
-                text_mem: vec![bucket],
+                text_mem,
                 pref_mem: vec![],
             }),
         })
@@ -282,6 +373,12 @@ where
         if node_owner != user_name {
             return Err(MemCubeError::NotFound(format!("memory not found: {}", id)));
         }
+        let mut payload_scope = node
+            .metadata
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or(MemoryScope::LongTermMemory.as_str())
+            .to_string();
 
         let mut fields = HashMap::new();
         if let Some(ref memory) = req.memory {
@@ -290,9 +387,32 @@ where
                 serde_json::Value::String(memory.clone()),
             );
         }
+        let mut scope_changed = false;
         if let Some(ref meta) = req.metadata {
             for (k, v) in meta {
-                fields.insert(k.clone(), v.clone());
+                if k == "scope" {
+                    if let Some(raw_scope) = v.as_str() {
+                        if let Some(normalized_scope) = Self::normalize_scope(raw_scope) {
+                            payload_scope = normalized_scope.to_string();
+                            fields.insert(
+                                "scope".to_string(),
+                                serde_json::Value::String(payload_scope.clone()),
+                            );
+                            scope_changed = true;
+                        } else {
+                            return Err(MemCubeError::BadRequest(format!(
+                                "invalid scope value: {}",
+                                raw_scope
+                            )));
+                        }
+                    } else {
+                        return Err(MemCubeError::BadRequest(
+                            "scope must be a string".to_string(),
+                        ));
+                    }
+                } else {
+                    fields.insert(k.clone(), v.clone());
+                }
             }
         }
         fields.insert(
@@ -307,8 +427,22 @@ where
                 .map_err(MemCubeError::Graph)?;
         }
 
-        if let Some(ref new_memory) = req.memory {
-            let embedding = self.embedder.embed(new_memory).await?;
+        if req.memory.is_some() || scope_changed {
+            let embedding = if let Some(ref new_memory) = req.memory {
+                self.embedder.embed(new_memory).await?
+            } else {
+                let ids = vec![id.to_string()];
+                let mut existing_items = self
+                    .vec_store
+                    .get_by_ids(&ids, None)
+                    .await
+                    .map_err(MemCubeError::Vec)?;
+                if let Some(existing_item) = existing_items.pop() {
+                    existing_item.vector
+                } else {
+                    self.embedder.embed(&node.memory).await?
+                }
+            };
             let payload = {
                 let mut p = HashMap::new();
                 p.insert(
@@ -318,6 +452,10 @@ where
                 p.insert(
                     "memory_type".to_string(),
                     serde_json::Value::String("text_mem".to_string()),
+                );
+                p.insert(
+                    "scope".to_string(),
+                    serde_json::Value::String(payload_scope),
                 );
                 p
             };
@@ -455,7 +593,9 @@ where
             .get_node(&req.memory_id, false)
             .await
             .map_err(MemCubeError::Graph)?
-            .ok_or_else(|| MemCubeError::NotFound(format!("memory not found: {}", req.memory_id)))?;
+            .ok_or_else(|| {
+                MemCubeError::NotFound(format!("memory not found: {}", req.memory_id))
+            })?;
         if Self::node_owner(&source.metadata) != user_name {
             return Err(MemCubeError::NotFound(format!(
                 "memory not found: {}",
@@ -518,12 +658,8 @@ where
             .collect();
 
         let limit = req.limit as usize;
-        let items: Vec<GraphNeighborItem> = all_items
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect();
+        let items: Vec<GraphNeighborItem> =
+            all_items.iter().skip(offset).take(limit).cloned().collect();
         let next_cursor = if offset + items.len() < all_items.len() {
             Some((offset + items.len()).to_string())
         } else {

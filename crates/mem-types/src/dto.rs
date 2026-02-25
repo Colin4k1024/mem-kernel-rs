@@ -145,6 +145,8 @@ pub struct MemoryItem {
 /// One bucket of memories (e.g. WorkingMemory, LongTermMemory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBucket {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub memories: Vec<MemoryItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_nodes: Option<usize>,

@@ -31,3 +31,4 @@ uuid = { version = "1", features = ["v4"] }
 mem-embed = { path = "../mem-embed", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+csv = "1.3"

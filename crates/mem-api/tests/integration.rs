@@ -9,7 +9,9 @@ use mem_embed::MockEmbedder;
 use mem_graph::InMemoryGraphStore;
 use mem_scheduler::InMemoryScheduler;
 use mem_vec::InMemoryVecStore;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower::util::ServiceExt;
 
@@ -1222,4 +1224,275 @@ async fn graph_paths_invalid_top_k_returns_400() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(j["code"], 400);
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ComplexMemoryFixture {
+    user_id: String,
+    mem_cube_id: String,
+    profile: HashMap<String, serde_json::Value>,
+    recent_chat: Vec<FixtureMessage>,
+    memories: Vec<FixtureMemory>,
+    questions: Vec<FixtureQuestion>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FixtureMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FixtureMemory {
+    stage: String,
+    scope: String,
+    memory_content: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FixtureQuestion {
+    stage: String,
+    scope: String,
+    query: String,
+    expected_contains: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CsvDatasetRow {
+    row_type: String,
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    mem_cube_id: String,
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    expected_contains: String,
+    #[serde(default)]
+    tags: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    job: String,
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    timezone: String,
+}
+
+fn split_tags(raw: &str) -> Vec<String> {
+    raw.split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn load_complex_memory_fixture() -> ComplexMemoryFixture {
+    let path = format!(
+        "{}/tests/fixtures/complex_dialogue_memory.csv",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(path)
+        .unwrap();
+
+    let mut user_id = String::new();
+    let mut mem_cube_id = String::new();
+    let mut profile = HashMap::new();
+    let mut recent_chat = Vec::new();
+    let mut memories = Vec::new();
+    let mut questions = Vec::new();
+
+    for row in rdr.deserialize::<CsvDatasetRow>() {
+        let row = row.unwrap();
+        match row.row_type.as_str() {
+            "profile" => {
+                user_id = row.user_id;
+                mem_cube_id = row.mem_cube_id;
+                profile.insert("name".to_string(), serde_json::Value::String(row.name));
+                profile.insert("city".to_string(), serde_json::Value::String(row.city));
+                profile.insert("job".to_string(), serde_json::Value::String(row.job));
+                profile.insert("language".to_string(), serde_json::Value::String(row.language));
+                profile.insert("timezone".to_string(), serde_json::Value::String(row.timezone));
+            }
+            "chat" => {
+                recent_chat.push(FixtureMessage {
+                    role: row.role,
+                    content: row.content,
+                });
+            }
+            "memory" => {
+                memories.push(FixtureMemory {
+                    stage: row.stage,
+                    scope: row.scope,
+                    memory_content: row.content,
+                    tags: split_tags(&row.tags),
+                });
+            }
+            "question" => {
+                questions.push(FixtureQuestion {
+                    stage: row.stage,
+                    scope: row.scope,
+                    query: row.query,
+                    expected_contains: row.expected_contains,
+                });
+            }
+            other => panic!("unsupported row_type: {}", other),
+        }
+    }
+
+    assert!(!user_id.is_empty(), "missing profile row user_id");
+    assert!(!mem_cube_id.is_empty(), "missing profile row mem_cube_id");
+    assert!(!recent_chat.is_empty(), "missing chat rows");
+    assert!(!memories.is_empty(), "missing memory rows");
+    assert!(!questions.is_empty(), "missing question rows");
+
+    ComplexMemoryFixture {
+        user_id,
+        mem_cube_id,
+        profile,
+        recent_chat,
+        memories,
+        questions,
+    }
+}
+
+#[tokio::test]
+async fn complex_dialogue_memory_returns_short_mid_long_term() {
+    let app = test_app();
+    let fixture = load_complex_memory_fixture();
+    for (stage, scope) in [
+        ("short_term", "WorkingMemory"),
+        ("mid_term", "UserMemory"),
+        ("long_term", "LongTermMemory"),
+    ] {
+        assert!(
+            fixture
+                .memories
+                .iter()
+                .any(|m| m.stage == stage && m.scope == scope),
+            "dataset missing memory stage={} scope={}",
+            stage,
+            scope
+        );
+        assert!(
+            fixture
+                .questions
+                .iter()
+                .any(|q| q.stage == stage && q.scope == scope),
+            "dataset missing question stage={} scope={}",
+            stage,
+            scope
+        );
+    }
+
+    for item in &fixture.memories {
+        let mut info = fixture.profile.clone();
+        info.insert(
+            "scope".to_string(),
+            serde_json::Value::String(item.scope.clone()),
+        );
+        info.insert(
+            "memory_stage".to_string(),
+            serde_json::Value::String(item.stage.clone()),
+        );
+
+        let add_body = json!({
+            "user_id": &fixture.user_id,
+            "mem_cube_id": &fixture.mem_cube_id,
+            "session_id": "sess-2026-02-25-complex",
+            "memory_content": &item.memory_content,
+            "chat_history": &fixture.recent_chat,
+            "custom_tags": &item.tags,
+            "info": info,
+            "async_mode": "sync"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/product/add")
+            .header("content-type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(j["code"], 200);
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/search")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "query": "Q: 明天长期目标是什么？A: 在 2026 年 Q3 前通过 Rust 异步系统设计面试，并每周六完成一次系统设计复盘。",
+                "user_id": &fixture.user_id,
+                "mem_cube_id": &fixture.mem_cube_id,
+                "top_k": 10
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let buckets = j["data"]["text_mem"].as_array().unwrap();
+    assert!(buckets.iter().any(|b| b["name"] == "short_term"));
+    assert!(buckets.iter().any(|b| b["name"] == "mid_term"));
+    assert!(buckets.iter().any(|b| b["name"] == "long_term"));
+
+    for q in &fixture.questions {
+        let search_body = json!({
+            "query": &q.query,
+            "user_id": &fixture.user_id,
+            "mem_cube_id": &fixture.mem_cube_id,
+            "top_k": 5,
+            "filter": {
+                "scope": &q.scope
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/product/search")
+            .header("content-type", "application/json")
+            .body(Body::from(search_body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(j["code"], 200);
+        let memories = j["data"]["text_mem"][0]["memories"].as_array().unwrap();
+        assert!(
+            !memories.is_empty(),
+            "no memory found for stage={} scope={}",
+            q.stage,
+            q.scope
+        );
+        assert!(memories
+            .iter()
+            .all(|m| m["metadata"]["scope"] == q.scope));
+        assert!(memories.iter().any(|m| {
+            m["memory"]
+                .as_str()
+                .map(|text| text.contains(&q.expected_contains))
+                .unwrap_or(false)
+        }));
+    }
 }
