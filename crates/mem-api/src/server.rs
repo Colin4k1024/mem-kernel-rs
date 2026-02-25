@@ -1,8 +1,10 @@
 //! Axum server and routes.
 
 use axum::{
+    extract::Extension,
+    extract::MatchedPath,
     extract::{Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -12,12 +14,16 @@ use mem_scheduler::Scheduler;
 use mem_types::MemCube;
 use mem_types::{
     ApiAddRequest, ApiSearchRequest, AuditEvent, AuditEventKind, AuditListOptions, AuditStore,
-    ForgetMemoryRequest, ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse, MemCubeError,
-    MemoryResponse, SchedulerStatusResponse, SearchResponse, UpdateMemoryRequest,
-    UpdateMemoryResponse,
+    ForgetMemoryRequest, ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse,
+    GraphNeighborsRequest, GraphNeighborsResponse, GraphPathRequest, GraphPathResponse,
+    GraphPathsRequest, GraphPathsResponse, MemCubeError, MemoryResponse, SchedulerStatusResponse,
+    SearchResponse, UpdateMemoryRequest, UpdateMemoryResponse,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -144,6 +150,192 @@ pub struct AppState {
     pub auth_token: Option<String>,
 }
 
+#[derive(Clone)]
+struct RequestMeta {
+    request_id: String,
+}
+
+struct ApiMetrics {
+    inner: Mutex<ApiMetricsInner>,
+}
+
+impl ApiMetrics {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ApiMetricsInner {
+                requests_total: HashMap::new(),
+                errors_total: HashMap::new(),
+                request_duration_ms: HashMap::new(),
+                duration_buckets_ms: vec![5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
+            }),
+        }
+    }
+
+    fn observe(&self, endpoint: String, method: String, status: u16, duration_ms: f64) {
+        let mut inner = self.inner.lock().expect("metrics mutex poisoned");
+        let req_key = RequestMetricKey {
+            endpoint: endpoint.clone(),
+            method: method.clone(),
+            status,
+        };
+        *inner.requests_total.entry(req_key.clone()).or_insert(0) += 1;
+        if status >= 400 {
+            *inner.errors_total.entry(req_key).or_insert(0) += 1;
+        }
+        let lat_key = LatencyMetricKey { endpoint, method };
+        let bucket_bounds = inner.duration_buckets_ms.clone();
+        let entry = inner
+            .request_duration_ms
+            .entry(lat_key)
+            .or_insert_with(|| LatencyMetric::new(bucket_bounds.len()));
+        entry.observe(duration_ms, &bucket_bounds);
+    }
+
+    fn render_prometheus(&self) -> String {
+        let inner = self.inner.lock().expect("metrics mutex poisoned");
+        let mut out = String::new();
+
+        out.push_str("# HELP mem_api_requests_total Total HTTP requests\n");
+        out.push_str("# TYPE mem_api_requests_total counter\n");
+        for (k, v) in &inner.requests_total {
+            out.push_str(&format!(
+                "mem_api_requests_total{{endpoint=\"{}\",method=\"{}\",status=\"{}\"}} {}\n",
+                escape_label(&k.endpoint),
+                escape_label(&k.method),
+                k.status,
+                v
+            ));
+        }
+
+        out.push_str("# HELP mem_api_errors_total Total HTTP error responses\n");
+        out.push_str("# TYPE mem_api_errors_total counter\n");
+        for (k, v) in &inner.errors_total {
+            out.push_str(&format!(
+                "mem_api_errors_total{{endpoint=\"{}\",method=\"{}\",status=\"{}\"}} {}\n",
+                escape_label(&k.endpoint),
+                escape_label(&k.method),
+                k.status,
+                v
+            ));
+        }
+
+        out.push_str("# HELP mem_api_request_duration_ms HTTP request latency in milliseconds\n");
+        out.push_str("# TYPE mem_api_request_duration_ms histogram\n");
+        for (k, v) in &inner.request_duration_ms {
+            let mut cumulative = 0u64;
+            for (idx, bucket_count) in v.buckets.iter().enumerate() {
+                cumulative += *bucket_count;
+                out.push_str(&format!(
+                    "mem_api_request_duration_ms_bucket{{endpoint=\"{}\",method=\"{}\",le=\"{}\"}} {}\n",
+                    escape_label(&k.endpoint),
+                    escape_label(&k.method),
+                    inner.duration_buckets_ms[idx],
+                    cumulative
+                ));
+            }
+            out.push_str(&format!(
+                "mem_api_request_duration_ms_bucket{{endpoint=\"{}\",method=\"{}\",le=\"+Inf\"}} {}\n",
+                escape_label(&k.endpoint),
+                escape_label(&k.method),
+                v.count
+            ));
+            out.push_str(&format!(
+                "mem_api_request_duration_ms_sum{{endpoint=\"{}\",method=\"{}\"}} {:.6}\n",
+                escape_label(&k.endpoint),
+                escape_label(&k.method),
+                v.sum
+            ));
+            out.push_str(&format!(
+                "mem_api_request_duration_ms_count{{endpoint=\"{}\",method=\"{}\"}} {}\n",
+                escape_label(&k.endpoint),
+                escape_label(&k.method),
+                v.count
+            ));
+        }
+
+        out
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RequestMetricKey {
+    endpoint: String,
+    method: String,
+    status: u16,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LatencyMetricKey {
+    endpoint: String,
+    method: String,
+}
+
+#[derive(Clone, Debug)]
+struct LatencyMetric {
+    buckets: Vec<u64>,
+    count: u64,
+    sum: f64,
+}
+
+impl LatencyMetric {
+    fn new(bucket_len: usize) -> Self {
+        Self {
+            buckets: vec![0; bucket_len],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+
+    fn observe(&mut self, duration_ms: f64, bucket_bounds: &[u64]) {
+        self.count += 1;
+        self.sum += duration_ms;
+        for (idx, upper) in bucket_bounds.iter().enumerate() {
+            if duration_ms <= *upper as f64 {
+                self.buckets[idx] += 1;
+                return;
+            }
+        }
+    }
+}
+
+struct ApiMetricsInner {
+    requests_total: HashMap<RequestMetricKey, u64>,
+    errors_total: HashMap<RequestMetricKey, u64>,
+    request_duration_ms: HashMap<LatencyMetricKey, LatencyMetric>,
+    duration_buckets_ms: Vec<u64>,
+}
+
+fn escape_label(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+static METRICS: OnceLock<ApiMetrics> = OnceLock::new();
+
+fn metrics() -> &'static ApiMetrics {
+    METRICS.get_or_init(ApiMetrics::new)
+}
+
+fn error_log_sample_rate() -> f64 {
+    std::env::var("MEMOS_ERROR_LOG_SAMPLE_RATE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(0.1)
+}
+
+fn should_sample(request_id: &str, rate: f64) -> bool {
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    request_id.hash(&mut h);
+    let bucket = h.finish() % 10_000;
+    bucket < (rate * 10_000.0) as u64
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let product_routes = Router::new()
         .route("/product/add", post(handle_add))
@@ -152,6 +344,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/product/update_memory", post(handle_update_memory))
         .route("/product/delete_memory", post(handle_delete_memory))
         .route("/product/get_memory", post(handle_get_memory))
+        .route("/product/graph/neighbors", post(handle_graph_neighbors))
+        .route("/product/graph/path", post(handle_graph_path))
+        .route("/product/graph/paths", post(handle_graph_paths))
         .route("/product/audit/list", get(handle_audit_list))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -160,9 +355,70 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .merge(product_routes)
+        .layer(middleware::from_fn(request_id_middleware))
+        .layer(middleware::from_fn(metrics_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn request_id_middleware(mut req: Request, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    req.extensions_mut().insert(RequestMeta {
+        request_id: request_id.clone(),
+    });
+    let mut response = next.run(req).await;
+    if let Ok(hv) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", hv);
+    }
+    response
+}
+
+async fn metrics_middleware(req: Request, next: Next) -> Response {
+    if req.uri().path() == "/metrics" {
+        return next.run(req).await;
+    }
+    let method = req.method().to_string();
+    let endpoint = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let started = Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let endpoint_for_log = endpoint.clone();
+    let method_for_log = method.clone();
+    metrics().observe(endpoint, method, status, duration_ms);
+    if status >= 400 {
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let sample_rate = error_log_sample_rate();
+        if should_sample(request_id, sample_rate) {
+            tracing::warn!(
+                endpoint = %endpoint_for_log,
+                method = %method_for_log,
+                request_id = %request_id,
+                status = status,
+                duration_ms = duration_ms,
+                sample_rate = sample_rate,
+                "sampled api error"
+            );
+        }
+    }
+    response
 }
 
 async fn require_auth(
@@ -201,6 +457,7 @@ async fn push_audit(state: &AppState, event: AuditEvent) {
 
 async fn handle_add(
     State(state): State<Arc<AppState>>,
+    Extension(req_meta): Extension<RequestMeta>,
     Json(req): Json<ApiAddRequest>,
 ) -> Json<MemoryResponse> {
     if req.async_mode.as_str() == "async" {
@@ -241,7 +498,7 @@ async fn handle_add(
                         user_id,
                         cube_id,
                         timestamp: chrono::Utc::now().to_rfc3339(),
-                        input_summary: None,
+                        input_summary: Some(format!("request_id={}", req_meta.request_id)),
                         outcome: Some(format!("code={}", res.code)),
                     },
                 )
@@ -313,6 +570,7 @@ async fn handle_scheduler_status(
 
 async fn handle_update_memory(
     State(state): State<Arc<AppState>>,
+    Extension(req_meta): Extension<RequestMeta>,
     Json(req): Json<UpdateMemoryRequest>,
 ) -> Json<UpdateMemoryResponse> {
     let user_id = req.user_id.clone();
@@ -332,7 +590,7 @@ async fn handle_update_memory(
                     user_id,
                     cube_id,
                     timestamp: chrono::Utc::now().to_rfc3339(),
-                    input_summary: None,
+                    input_summary: Some(format!("request_id={}", req_meta.request_id)),
                     outcome: Some(format!("code={}", res.code)),
                 },
             )
@@ -354,6 +612,7 @@ async fn handle_update_memory(
 
 async fn handle_delete_memory(
     State(state): State<Arc<AppState>>,
+    Extension(req_meta): Extension<RequestMeta>,
     Json(req): Json<ForgetMemoryRequest>,
 ) -> Json<ForgetMemoryResponse> {
     let user_id = req.user_id.clone();
@@ -373,7 +632,7 @@ async fn handle_delete_memory(
                     user_id,
                     cube_id,
                     timestamp: chrono::Utc::now().to_rfc3339(),
-                    input_summary: None,
+                    input_summary: Some(format!("request_id={}", req_meta.request_id)),
                     outcome: Some(format!("code={}", res.code)),
                 },
             )
@@ -405,6 +664,123 @@ async fn handle_get_memory(
             data: None,
         }),
     }
+}
+
+async fn handle_graph_neighbors(
+    State(state): State<Arc<AppState>>,
+    Extension(req_meta): Extension<RequestMeta>,
+    Json(req): Json<GraphNeighborsRequest>,
+) -> Json<GraphNeighborsResponse> {
+    let started = Instant::now();
+    let response = match state.cube.graph_neighbors(&req).await {
+        Ok(res) => Json(res),
+        Err(MemCubeError::BadRequest(msg)) => Json(GraphNeighborsResponse {
+            code: 400,
+            message: msg,
+            data: None,
+        }),
+        Err(MemCubeError::NotFound(msg)) => Json(GraphNeighborsResponse {
+            code: 404,
+            message: msg,
+            data: None,
+        }),
+        Err(e) => Json(GraphNeighborsResponse {
+            code: 500,
+            message: e.to_string(),
+            data: None,
+        }),
+    };
+    let items = response.0.data.as_ref().map(|d| d.items.len()).unwrap_or(0);
+    tracing::info!(
+        endpoint = "/product/graph/neighbors",
+        request_id = %req_meta.request_id,
+        memory_id = %req.memory_id,
+        user_id = %req.user_id,
+        code = response.0.code,
+        items = items,
+        duration_ms = started.elapsed().as_millis(),
+        "graph neighbors handled"
+    );
+    response
+}
+
+async fn handle_graph_path(
+    State(state): State<Arc<AppState>>,
+    Extension(req_meta): Extension<RequestMeta>,
+    Json(req): Json<GraphPathRequest>,
+) -> Json<GraphPathResponse> {
+    let started = Instant::now();
+    let response = match state.cube.graph_path(&req).await {
+        Ok(res) => Json(res),
+        Err(MemCubeError::BadRequest(msg)) => Json(GraphPathResponse {
+            code: 400,
+            message: msg,
+            data: None,
+        }),
+        Err(MemCubeError::NotFound(msg)) => Json(GraphPathResponse {
+            code: 404,
+            message: msg,
+            data: None,
+        }),
+        Err(e) => Json(GraphPathResponse {
+            code: 500,
+            message: e.to_string(),
+            data: None,
+        }),
+    };
+    let hops = response.0.data.as_ref().map(|d| d.hops).unwrap_or(0);
+    tracing::info!(
+        endpoint = "/product/graph/path",
+        request_id = %req_meta.request_id,
+        source_memory_id = %req.source_memory_id,
+        target_memory_id = %req.target_memory_id,
+        user_id = %req.user_id,
+        code = response.0.code,
+        hops = hops,
+        duration_ms = started.elapsed().as_millis(),
+        "graph path handled"
+    );
+    response
+}
+
+async fn handle_graph_paths(
+    State(state): State<Arc<AppState>>,
+    Extension(req_meta): Extension<RequestMeta>,
+    Json(req): Json<GraphPathsRequest>,
+) -> Json<GraphPathsResponse> {
+    let started = Instant::now();
+    let response = match state.cube.graph_paths(&req).await {
+        Ok(res) => Json(res),
+        Err(MemCubeError::BadRequest(msg)) => Json(GraphPathsResponse {
+            code: 400,
+            message: msg,
+            data: None,
+        }),
+        Err(MemCubeError::NotFound(msg)) => Json(GraphPathsResponse {
+            code: 404,
+            message: msg,
+            data: None,
+        }),
+        Err(e) => Json(GraphPathsResponse {
+            code: 500,
+            message: e.to_string(),
+            data: None,
+        }),
+    };
+    let path_count = response.0.data.as_ref().map(|d| d.len()).unwrap_or(0);
+    tracing::info!(
+        endpoint = "/product/graph/paths",
+        request_id = %req_meta.request_id,
+        source_memory_id = %req.source_memory_id,
+        target_memory_id = %req.target_memory_id,
+        user_id = %req.user_id,
+        top_k_paths = req.top_k_paths,
+        code = response.0.code,
+        path_count = path_count,
+        duration_ms = started.elapsed().as_millis(),
+        "graph paths handled"
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,4 +832,13 @@ pub struct AuditListResponse {
 
 async fn handle_health() -> &'static str {
     "ok"
+}
+
+async fn handle_metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4".to_string())],
+        metrics().render_prometheus(),
+    )
+        .into_response()
 }

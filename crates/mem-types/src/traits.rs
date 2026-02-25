@@ -2,8 +2,10 @@
 
 use crate::{
     ApiAddRequest, ApiSearchRequest, AuditEvent, AuditListOptions, ForgetMemoryRequest,
-    ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse, MemoryNode, MemoryResponse,
-    SearchResponse, UpdateMemoryRequest, UpdateMemoryResponse,
+    ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse, GraphDirection, GraphNeighbor,
+    GraphNeighborsRequest, GraphNeighborsResponse, GraphPath, GraphPathRequest, GraphPathResponse,
+    GraphPathsRequest, GraphPathsResponse, MemoryEdge, MemoryNode, MemoryResponse, SearchResponse,
+    UpdateMemoryRequest, UpdateMemoryResponse,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -34,6 +36,13 @@ pub trait GraphStore: Send + Sync {
         user_name: Option<&str>,
     ) -> Result<(), GraphStoreError>;
 
+    /// Add multiple edges in batch.
+    async fn add_edges_batch(
+        &self,
+        edges: &[MemoryEdge],
+        user_name: Option<&str>,
+    ) -> Result<(), GraphStoreError>;
+
     /// Get one node by id.
     async fn get_node(
         &self,
@@ -47,6 +56,42 @@ pub trait GraphStore: Send + Sync {
         ids: &[String],
         include_embedding: bool,
     ) -> Result<Vec<MemoryNode>, GraphStoreError>;
+
+    /// Get neighbors of one node, optionally filtered by relation and direction.
+    async fn get_neighbors(
+        &self,
+        id: &str,
+        relation: Option<&str>,
+        direction: GraphDirection,
+        limit: usize,
+        include_embedding: bool,
+        user_name: Option<&str>,
+    ) -> Result<Vec<GraphNeighbor>, GraphStoreError>;
+
+    /// Shortest path query between source and target by BFS hops.
+    async fn shortest_path(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: Option<&str>,
+        direction: GraphDirection,
+        max_depth: usize,
+        include_deleted: bool,
+        user_name: Option<&str>,
+    ) -> Result<Option<GraphPath>, GraphStoreError>;
+
+    /// Enumerate top-k shortest simple paths by BFS hops.
+    async fn find_paths(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: Option<&str>,
+        direction: GraphDirection,
+        max_depth: usize,
+        top_k: usize,
+        include_deleted: bool,
+        user_name: Option<&str>,
+    ) -> Result<Vec<GraphPath>, GraphStoreError>;
 
     /// Search by embedding vector (returns node ids + scores).
     async fn search_by_embedding(
@@ -75,6 +120,13 @@ pub trait GraphStore: Send + Sync {
     /// Delete a node (hard delete). If `user_name` is `Some`, implementation must verify
     /// the node belongs to that user/cube (e.g. via metadata) before deleting; return error if not owner.
     async fn delete_node(&self, id: &str, user_name: Option<&str>) -> Result<(), GraphStoreError>;
+
+    /// Delete all edges connected to a node. Returns number of deleted edges.
+    async fn delete_edges_by_node(
+        &self,
+        id: &str,
+        user_name: Option<&str>,
+    ) -> Result<usize, GraphStoreError>;
 }
 
 /// Vector store abstraction (subset of MemOS BaseVecDB).
@@ -159,6 +211,21 @@ pub trait MemCube: Send + Sync {
 
     /// Get a single memory by id (within user/cube scope).
     async fn get_memory(&self, req: &GetMemoryRequest) -> Result<GetMemoryResponse, MemCubeError>;
+
+    /// Query graph neighbors for one memory id.
+    async fn graph_neighbors(
+        &self,
+        req: &GraphNeighborsRequest,
+    ) -> Result<GraphNeighborsResponse, MemCubeError>;
+
+    /// Query shortest path between two memory nodes.
+    async fn graph_path(&self, req: &GraphPathRequest) -> Result<GraphPathResponse, MemCubeError>;
+
+    /// Query top-k shortest paths between two memory nodes.
+    async fn graph_paths(
+        &self,
+        req: &GraphPathsRequest,
+    ) -> Result<GraphPathsResponse, MemCubeError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -201,6 +268,8 @@ pub enum AuditStoreError {
 pub enum MemCubeError {
     #[error("mem cube error: {0}")]
     Other(String),
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("embedder: {0}")]

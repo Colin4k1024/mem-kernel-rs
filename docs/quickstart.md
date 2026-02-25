@@ -73,3 +73,53 @@ curl -sS "http://localhost:8001/product/scheduler/status?user_id=u1&task_id=<tas
 - 查询空间：`readable_cube_ids -> mem_cube_id -> [user_id]`
 
 建议：同一业务租户统一使用同一个 `user_id + mem_cube_id` 组合。
+
+## 7. 图关系查询（neighbors）
+
+给新记忆与已有记忆建边：
+
+```bash
+curl -sS -X POST http://localhost:8001/product/add \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user_id": "u1",
+    "mem_cube_id": "u1",
+    "memory_content": "I like peach too",
+    "relations": [{
+      "memory_id": "<existing-memory-id>",
+      "relation": "related_to",
+      "direction": "outbound"
+    }]
+  }'
+```
+
+查询邻居：
+
+```bash
+curl -sS -X POST http://localhost:8001/product/graph/neighbors \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "memory_id": "<new-memory-id>",
+    "user_id": "u1",
+    "direction": "outbound",
+    "relation": "related_to",
+    "limit": 10
+  }'
+```
+
+如果返回里包含 `data.next_cursor`，可在下一次请求中传入 `cursor` 分页继续读取。
+
+查询两点最短路径：
+
+```bash
+curl -sS -X POST http://localhost:8001/product/graph/path \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_memory_id": "<source-id>",
+    "target_memory_id": "<target-id>",
+    "user_id": "u1",
+    "direction": "outbound",
+    "relation": "related_to",
+    "max_depth": 6
+  }'
+```

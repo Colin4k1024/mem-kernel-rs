@@ -37,8 +37,12 @@ Rust implementation of a MemOS-compatible memory kernel: unified add/search/upda
 - `POST /product/update_memory`
 - `POST /product/delete_memory`
 - `POST /product/get_memory`
+- `POST /product/graph/neighbors`
+- `POST /product/graph/path`
+- `POST /product/graph/paths`
 - `GET /product/audit/list`
 - `GET /health`
+- `GET /metrics`
 
 ## Quick start
 
@@ -116,6 +120,23 @@ curl -sS -X POST http://localhost:8001/product/delete_memory \
     "memory_id": "<memory-id>",
     "user_id": "u1",
     "soft": true
+  }'
+```
+
+### Add memory with graph relation
+
+```bash
+curl -sS -X POST http://localhost:8001/product/add \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user_id": "u1",
+    "mem_cube_id": "u1",
+    "memory_content": "I also like peach",
+    "relations": [{
+      "memory_id": "<existing-memory-id>",
+      "relation": "related_to",
+      "direction": "outbound"
+    }]
   }'
 ```
 

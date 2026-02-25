@@ -6,6 +6,8 @@
 - `RUST_LOG`：日志级别，默认 `info`
 - `MEMOS_AUTH_TOKEN`：可选。设置后，所有 `/product/*` 接口需要
   `Authorization: Bearer <token>`
+- `MEMOS_ERROR_LOG_SAMPLE_RATE`：错误日志采样率，范围 `[0,1]`，默认 `0.1`
+  （例如 `0` 关闭、`1` 全量）
 
 ## Embedding 配置
 
@@ -32,3 +34,4 @@
 - 使用 Qdrant + `AUDIT_LOG_PATH`
 - 配置进程守护（systemd / supervisor / k8s）
 - 在网关层做鉴权与限流
+- `MEMOS_ERROR_LOG_SAMPLE_RATE` 建议 `0.05 ~ 0.2`，高峰流量下避免日志风暴

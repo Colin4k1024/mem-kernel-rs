@@ -3,6 +3,9 @@
 mod memory;
 mod store;
 
-pub use mem_types::{GraphStoreError, MemoryNode, VecSearchHit};
+pub use mem_types::{
+    GraphDirection, GraphNeighbor, GraphPath, GraphStoreError, MemoryEdge, MemoryNode,
+    VecSearchHit,
+};
 pub use memory::InMemoryGraphStore;
 pub use store::GraphStore;

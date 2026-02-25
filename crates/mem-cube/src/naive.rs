@@ -31,6 +31,22 @@ where
             default_scope: "LongTermMemory".to_string(),
         }
     }
+
+    fn node_owner(metadata: &HashMap<String, serde_json::Value>) -> &str {
+        metadata
+            .get("user_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
+    fn parse_cursor(cursor: Option<&str>) -> Result<usize, MemCubeError> {
+        match cursor {
+            Some(c) => c
+                .parse::<usize>()
+                .map_err(|_| MemCubeError::BadRequest("invalid graph cursor".to_string())),
+            None => Ok(0),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -70,6 +86,64 @@ where
             .await
             .map_err(MemCubeError::Graph)?;
 
+        if let Some(relations) = req.relations.as_ref() {
+            if !relations.is_empty() {
+                let mut edges = Vec::new();
+                for rel in relations {
+                    let mut base_metadata = rel.metadata.clone();
+                    base_metadata.insert(
+                        "created_at".to_string(),
+                        serde_json::Value::String(Utc::now().to_rfc3339()),
+                    );
+                    match rel.direction {
+                        GraphDirection::Outbound => {
+                            edges.push(MemoryEdge {
+                                id: Uuid::new_v4().to_string(),
+                                from: id.clone(),
+                                to: rel.memory_id.clone(),
+                                relation: rel.relation.clone(),
+                                metadata: base_metadata.clone(),
+                            });
+                        }
+                        GraphDirection::Inbound => {
+                            edges.push(MemoryEdge {
+                                id: Uuid::new_v4().to_string(),
+                                from: rel.memory_id.clone(),
+                                to: id.clone(),
+                                relation: rel.relation.clone(),
+                                metadata: base_metadata.clone(),
+                            });
+                        }
+                        GraphDirection::Both => {
+                            edges.push(MemoryEdge {
+                                id: Uuid::new_v4().to_string(),
+                                from: id.clone(),
+                                to: rel.memory_id.clone(),
+                                relation: rel.relation.clone(),
+                                metadata: base_metadata.clone(),
+                            });
+                            edges.push(MemoryEdge {
+                                id: Uuid::new_v4().to_string(),
+                                from: rel.memory_id.clone(),
+                                to: id.clone(),
+                                relation: rel.relation.clone(),
+                                metadata: base_metadata.clone(),
+                            });
+                        }
+                    }
+                }
+                if let Err(e) = self
+                    .graph
+                    .add_edges_batch(&edges, Some(user_name))
+                    .await
+                {
+                    // Keep add operation atomic-ish for graph writes.
+                    let _ = self.graph.delete_node(&id, Some(user_name)).await;
+                    return Err(MemCubeError::Graph(e));
+                }
+            }
+        }
+
         let payload = {
             let mut p = HashMap::new();
             p.insert(
@@ -87,10 +161,11 @@ where
             vector: embedding,
             payload,
         };
-        self.vec_store
-            .add(&[item], None)
-            .await
-            .map_err(MemCubeError::Vec)?;
+        if let Err(e) = self.vec_store.add(&[item], None).await {
+            // Avoid partial success: if vec write fails, rollback graph node and edges.
+            let _ = self.graph.delete_node(&id, Some(user_name)).await;
+            return Err(MemCubeError::Vec(e));
+        }
 
         let data = vec![serde_json::json!({ "id": id, "memory": content })];
         Ok(MemoryResponse {
@@ -203,11 +278,7 @@ where
             .map_err(MemCubeError::Graph)?;
         let node =
             existing.ok_or_else(|| MemCubeError::NotFound(format!("memory not found: {}", id)))?;
-        let node_owner = node
-            .metadata
-            .get("user_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let node_owner = Self::node_owner(&node.metadata);
         if node_owner != user_name {
             return Err(MemCubeError::NotFound(format!("memory not found: {}", id)));
         }
@@ -283,11 +354,7 @@ where
             .map_err(MemCubeError::Graph)?;
         let node =
             existing.ok_or_else(|| MemCubeError::NotFound(format!("memory not found: {}", id)))?;
-        let node_owner = node
-            .metadata
-            .get("user_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let node_owner = Self::node_owner(&node.metadata);
         if node_owner != user_name {
             return Err(MemCubeError::NotFound(format!("memory not found: {}", id)));
         }
@@ -345,11 +412,7 @@ where
                 });
             }
         };
-        let node_user = node
-            .metadata
-            .get("user_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let node_user = Self::node_owner(&node.metadata);
         if node_user != user_name {
             return Ok(GetMemoryResponse {
                 code: 404,
@@ -378,6 +441,226 @@ where
             code: 200,
             message: "Success".to_string(),
             data: Some(item),
+        })
+    }
+
+    async fn graph_neighbors(
+        &self,
+        req: &GraphNeighborsRequest,
+    ) -> Result<GraphNeighborsResponse, MemCubeError> {
+        let user_name = req.mem_cube_id.as_deref().unwrap_or(req.user_id.as_str());
+        let offset = Self::parse_cursor(req.cursor.as_deref())?;
+        let source = self
+            .graph
+            .get_node(&req.memory_id, false)
+            .await
+            .map_err(MemCubeError::Graph)?
+            .ok_or_else(|| MemCubeError::NotFound(format!("memory not found: {}", req.memory_id)))?;
+        if Self::node_owner(&source.metadata) != user_name {
+            return Err(MemCubeError::NotFound(format!(
+                "memory not found: {}",
+                req.memory_id
+            )));
+        }
+        let source_state = source
+            .metadata
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("active");
+        if source_state == "tombstone" && !req.include_deleted {
+            return Err(MemCubeError::NotFound(format!(
+                "memory not found: {}",
+                req.memory_id
+            )));
+        }
+
+        let neighbors = self
+            .graph
+            .get_neighbors(
+                &req.memory_id,
+                req.relation.as_deref(),
+                req.direction,
+                usize::MAX,
+                req.include_embedding,
+                Some(user_name),
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("access denied") {
+                    MemCubeError::NotFound(format!("memory not found: {}", req.memory_id))
+                } else {
+                    MemCubeError::Graph(e)
+                }
+            })?;
+
+        let all_items: Vec<GraphNeighborItem> = neighbors
+            .into_iter()
+            .filter(|n| {
+                if req.include_deleted {
+                    return true;
+                }
+                n.node
+                    .metadata
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("active")
+                    != "tombstone"
+            })
+            .map(|n| GraphNeighborItem {
+                edge: n.edge,
+                memory: MemoryItem {
+                    id: n.node.id,
+                    memory: n.node.memory,
+                    metadata: n.node.metadata,
+                },
+            })
+            .collect();
+
+        let limit = req.limit as usize;
+        let items: Vec<GraphNeighborItem> = all_items
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        let next_cursor = if offset + items.len() < all_items.len() {
+            Some((offset + items.len()).to_string())
+        } else {
+            None
+        };
+
+        Ok(GraphNeighborsResponse {
+            code: 200,
+            message: "Success".to_string(),
+            data: Some(GraphNeighborsData { items, next_cursor }),
+        })
+    }
+
+    async fn graph_path(&self, req: &GraphPathRequest) -> Result<GraphPathResponse, MemCubeError> {
+        let user_name = req.mem_cube_id.as_deref().unwrap_or(req.user_id.as_str());
+        let path = self
+            .graph
+            .shortest_path(
+                &req.source_memory_id,
+                &req.target_memory_id,
+                req.relation.as_deref(),
+                req.direction,
+                req.max_depth as usize,
+                req.include_deleted,
+                Some(user_name),
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("access denied") {
+                    MemCubeError::NotFound(format!(
+                        "memory not found: {} or {}",
+                        req.source_memory_id, req.target_memory_id
+                    ))
+                } else {
+                    MemCubeError::Graph(e)
+                }
+            })?
+            .ok_or_else(|| {
+                MemCubeError::NotFound(format!(
+                    "path not found: {} -> {}",
+                    req.source_memory_id, req.target_memory_id
+                ))
+            })?;
+
+        let nodes = self
+            .graph
+            .get_nodes(&path.node_ids, false)
+            .await
+            .map_err(MemCubeError::Graph)?;
+        let items: Vec<MemoryItem> = nodes
+            .into_iter()
+            .map(|n| MemoryItem {
+                id: n.id,
+                memory: n.memory,
+                metadata: n.metadata,
+            })
+            .collect();
+
+        Ok(GraphPathResponse {
+            code: 200,
+            message: "Success".to_string(),
+            data: Some(GraphPathData {
+                hops: path.edges.len() as u32,
+                nodes: items,
+                edges: path.edges,
+            }),
+        })
+    }
+
+    async fn graph_paths(
+        &self,
+        req: &GraphPathsRequest,
+    ) -> Result<GraphPathsResponse, MemCubeError> {
+        if req.top_k_paths == 0 {
+            return Err(MemCubeError::BadRequest(
+                "top_k_paths must be greater than 0".to_string(),
+            ));
+        }
+        let user_name = req.mem_cube_id.as_deref().unwrap_or(req.user_id.as_str());
+        let paths = self
+            .graph
+            .find_paths(
+                &req.source_memory_id,
+                &req.target_memory_id,
+                req.relation.as_deref(),
+                req.direction,
+                req.max_depth as usize,
+                req.top_k_paths as usize,
+                req.include_deleted,
+                Some(user_name),
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("access denied") {
+                    MemCubeError::NotFound(format!(
+                        "memory not found: {} or {}",
+                        req.source_memory_id, req.target_memory_id
+                    ))
+                } else {
+                    MemCubeError::Graph(e)
+                }
+            })?;
+        if paths.is_empty() {
+            return Err(MemCubeError::NotFound(format!(
+                "path not found: {} -> {}",
+                req.source_memory_id, req.target_memory_id
+            )));
+        }
+
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let nodes = self
+                .graph
+                .get_nodes(&path.node_ids, false)
+                .await
+                .map_err(MemCubeError::Graph)?;
+            let items: Vec<MemoryItem> = nodes
+                .into_iter()
+                .map(|n| MemoryItem {
+                    id: n.id,
+                    memory: n.memory,
+                    metadata: n.metadata,
+                })
+                .collect();
+            out.push(GraphPathData {
+                hops: path.edges.len() as u32,
+                nodes: items,
+                edges: path.edges,
+            });
+        }
+
+        Ok(GraphPathsResponse {
+            code: 200,
+            message: "Success".to_string(),
+            data: Some(out),
         })
     }
 }

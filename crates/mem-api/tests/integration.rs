@@ -608,3 +608,618 @@ async fn auth_accepts_request_with_valid_bearer_token() {
     let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(j["code"], 200);
 }
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_prometheus_text() {
+    let app = test_app();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("mem_api_requests_total"));
+    assert!(text.contains("mem_api_errors_total"));
+    assert!(text.contains("mem_api_request_duration_ms"));
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_and_written_to_audit() {
+    let app = test_app();
+    let add_body = json!({
+        "user_id": "rid_u1",
+        "mem_cube_id": "rid_u1",
+        "memory_content": "request id tracing",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .header("x-request-id", "req-12345")
+        .body(Body::from(add_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let header_val = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(header_val, "req-12345");
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/product/audit/list?user_id=rid_u1&cube_id=rid_u1&limit=1")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    let summary = j["data"][0]["input_summary"].as_str().unwrap_or("");
+    assert!(summary.contains("request_id=req-12345"));
+}
+
+#[tokio::test]
+async fn add_with_relations_then_query_neighbors() {
+    let app = test_app();
+
+    let first = json!({
+        "user_id": "g1",
+        "mem_cube_id": "g1",
+        "memory_content": "Graph base node",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(first.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id1 = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let second = json!({
+        "user_id": "g1",
+        "mem_cube_id": "g1",
+        "memory_content": "Graph linked node",
+        "async_mode": "sync",
+        "relations": [
+            {
+                "memory_id": id1,
+                "relation": "related_to",
+                "direction": "outbound"
+            }
+        ]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(second.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id2 = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let neighbors_body = json!({
+        "memory_id": id2,
+        "user_id": "g1",
+        "direction": "outbound",
+        "relation": "related_to",
+        "limit": 10
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/neighbors")
+        .header("content-type", "application/json")
+        .body(Body::from(neighbors_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    let data = j["data"]["items"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["edge"]["relation"], "related_to");
+    assert_eq!(data[0]["memory"]["id"], id1);
+    assert_eq!(data[0]["memory"]["memory"], "Graph base node");
+}
+
+#[tokio::test]
+async fn graph_neighbors_supports_cursor_pagination() {
+    let app = test_app();
+
+    let root = json!({
+        "user_id": "g_page",
+        "mem_cube_id": "g_page",
+        "memory_content": "Root",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(root.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let root_id = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    for i in 0..3 {
+        let add = json!({
+            "user_id": "g_page",
+            "mem_cube_id": "g_page",
+            "memory_content": format!("Leaf {}", i),
+            "async_mode": "sync",
+            "relations": [{
+                "memory_id": root_id,
+                "relation": "related_to",
+                "direction": "outbound"
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/product/add")
+            .header("content-type", "application/json")
+            .body(Body::from(add.to_string()))
+            .unwrap();
+        let _ = app.clone().oneshot(req).await.unwrap();
+    }
+
+    let page1 = json!({
+        "memory_id": root_id,
+        "user_id": "g_page",
+        "direction": "inbound",
+        "relation": "related_to",
+        "limit": 2
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/neighbors")
+        .header("content-type", "application/json")
+        .body(Body::from(page1.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j1: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items1 = j1["data"]["items"].as_array().unwrap();
+    assert_eq!(items1.len(), 2);
+    let cursor = j1["data"]["next_cursor"].as_str().unwrap().to_string();
+
+    let page2 = json!({
+        "memory_id": root_id,
+        "user_id": "g_page",
+        "direction": "inbound",
+        "relation": "related_to",
+        "limit": 2,
+        "cursor": cursor
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/neighbors")
+        .header("content-type", "application/json")
+        .body(Body::from(page2.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items2 = j2["data"]["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert!(j2["data"]["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn graph_neighbors_invalid_cursor_returns_400() {
+    let app = test_app();
+    let req_body = json!({
+        "memory_id": "does-not-matter",
+        "user_id": "u1",
+        "cursor": "not-a-number"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/neighbors")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 400);
+}
+
+#[tokio::test]
+async fn relation_cannot_link_to_other_tenant_and_rolls_back() {
+    let app = test_app();
+
+    let add_alice = json!({
+        "user_id": "alice_g",
+        "mem_cube_id": "alice_g",
+        "memory_content": "Alice graph root",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_alice.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let alice_id = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let add_bob = json!({
+        "user_id": "bob_g",
+        "mem_cube_id": "bob_g",
+        "memory_content": "Bob should rollback",
+        "async_mode": "sync",
+        "relations": [
+            {
+                "memory_id": alice_id,
+                "relation": "related_to",
+                "direction": "outbound"
+            }
+        ]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_bob.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 500);
+
+    // Bob add should be rolled back entirely.
+    let search_bob = json!({
+        "query": "rollback",
+        "user_id": "bob_g"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/search")
+        .header("content-type", "application/json")
+        .body(Body::from(search_bob.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let memories = j["data"]["text_mem"][0]["memories"].as_array().unwrap();
+    assert!(memories.is_empty());
+}
+
+#[tokio::test]
+async fn graph_edges_are_removed_when_node_deleted() {
+    let app = test_app();
+
+    let first = json!({
+        "user_id": "g_del",
+        "mem_cube_id": "g_del",
+        "memory_content": "Delete graph base",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(first.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id1 = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let second = json!({
+        "user_id": "g_del",
+        "mem_cube_id": "g_del",
+        "memory_content": "Delete graph linked",
+        "async_mode": "sync",
+        "relations": [
+            {
+                "memory_id": id1,
+                "relation": "depends_on",
+                "direction": "outbound"
+            }
+        ]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(second.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id2 = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let neighbors_before = json!({
+        "memory_id": id1,
+        "user_id": "g_del",
+        "direction": "inbound",
+        "relation": "depends_on",
+        "limit": 10
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/neighbors")
+        .header("content-type", "application/json")
+        .body(Body::from(neighbors_before.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let before = j["data"]["items"].as_array().unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["memory"]["id"], id2);
+
+    let del_body = json!({ "memory_id": id2, "user_id": "g_del", "soft": false });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/delete_memory")
+        .header("content-type", "application/json")
+        .body(Body::from(del_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let neighbors_after = json!({
+        "memory_id": id1,
+        "user_id": "g_del",
+        "direction": "inbound",
+        "relation": "depends_on",
+        "limit": 10
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/neighbors")
+        .header("content-type", "application/json")
+        .body(Body::from(neighbors_after.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let after = j["data"]["items"].as_array().unwrap();
+    assert!(after.is_empty());
+}
+
+#[tokio::test]
+async fn graph_path_returns_shortest_hops() {
+    let app = test_app();
+
+    let add_a = json!({
+        "user_id": "g_path",
+        "mem_cube_id": "g_path",
+        "memory_content": "Path A",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_a.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id_a = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let add_b = json!({
+        "user_id": "g_path",
+        "mem_cube_id": "g_path",
+        "memory_content": "Path B",
+        "async_mode": "sync",
+        "relations": [{
+            "memory_id": id_a,
+            "relation": "depends_on",
+            "direction": "outbound"
+        }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_b.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id_b = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let add_c = json!({
+        "user_id": "g_path",
+        "mem_cube_id": "g_path",
+        "memory_content": "Path C",
+        "async_mode": "sync",
+        "relations": [{
+            "memory_id": id_b,
+            "relation": "depends_on",
+            "direction": "outbound"
+        }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_c.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id_c = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let path_req = json!({
+        "source_memory_id": id_c,
+        "target_memory_id": id_a,
+        "user_id": "g_path",
+        "direction": "outbound",
+        "relation": "depends_on",
+        "max_depth": 4
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/path")
+        .header("content-type", "application/json")
+        .body(Body::from(path_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    assert_eq!(j["data"]["hops"], 2);
+    let nodes = j["data"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes[0]["id"], id_c);
+    assert_eq!(nodes[1]["id"], id_b);
+    assert_eq!(nodes[2]["id"], id_a);
+    let edges = j["data"]["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2);
+}
+
+#[tokio::test]
+async fn graph_paths_returns_multiple_candidates() {
+    let app = test_app();
+
+    let add_s = json!({
+        "user_id": "g_paths",
+        "mem_cube_id": "g_paths",
+        "memory_content": "S",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_s.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let s_id = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let add_a = json!({
+        "user_id": "g_paths",
+        "mem_cube_id": "g_paths",
+        "memory_content": "A",
+        "async_mode": "sync",
+        "relations": [{
+            "memory_id": s_id,
+            "relation": "r",
+            "direction": "inbound"
+        }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_a.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let a_id = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let add_b = json!({
+        "user_id": "g_paths",
+        "mem_cube_id": "g_paths",
+        "memory_content": "B",
+        "async_mode": "sync",
+        "relations": [{
+            "memory_id": s_id,
+            "relation": "r",
+            "direction": "inbound"
+        }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_b.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let b_id = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let add_t = json!({
+        "user_id": "g_paths",
+        "mem_cube_id": "g_paths",
+        "memory_content": "T",
+        "async_mode": "sync",
+        "relations": [
+            { "memory_id": a_id, "relation": "r", "direction": "inbound" },
+            { "memory_id": b_id, "relation": "r", "direction": "inbound" }
+        ]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_t.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let t_id = j["data"][0]["id"].as_str().unwrap().to_string();
+
+    let req_body = json!({
+        "source_memory_id": s_id,
+        "target_memory_id": t_id,
+        "user_id": "g_paths",
+        "direction": "outbound",
+        "relation": "r",
+        "max_depth": 4,
+        "top_k_paths": 2
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/paths")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    let paths = j["data"].as_array().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0]["hops"], 2);
+    assert_eq!(paths[1]["hops"], 2);
+}
+
+#[tokio::test]
+async fn graph_paths_invalid_top_k_returns_400() {
+    let app = test_app();
+    let req_body = json!({
+        "source_memory_id": "a",
+        "target_memory_id": "b",
+        "user_id": "u1",
+        "top_k_paths": 0
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/graph/paths")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 400);
+}

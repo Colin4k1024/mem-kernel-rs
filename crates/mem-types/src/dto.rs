@@ -34,6 +34,9 @@ pub struct ApiAddRequest {
     pub custom_tags: Option<Vec<String>>,
     #[serde(default)]
     pub info: Option<HashMap<String, serde_json::Value>>,
+    /// Optional graph relations to existing memories while adding this new memory.
+    #[serde(default)]
+    pub relations: Option<Vec<AddMemoryRelation>>,
     #[serde(default)]
     pub is_feedback: bool,
 }
@@ -195,6 +198,20 @@ pub struct ForgetMemoryRequest {
 pub type UpdateMemoryResponse = BaseResponse<Vec<serde_json::Value>>;
 pub type ForgetMemoryResponse = BaseResponse<Vec<serde_json::Value>>;
 
+/// Optional relation spec used by add-memory request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddMemoryRelation {
+    /// Existing memory id to connect with the newly added memory.
+    pub memory_id: String,
+    pub relation: String,
+    /// Edge direction relative to the newly added memory node.
+    /// `outbound`: new -> memory_id; `inbound`: memory_id -> new; `both`: write both edges.
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
 /// Request to get a single memory by id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetMemoryRequest {
@@ -224,6 +241,150 @@ pub struct MemoryNode {
     pub memory: String,
     pub metadata: HashMap<String, serde_json::Value>,
     pub embedding: Option<Vec<f32>>,
+}
+
+/// Graph edge between two memory nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEdge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Neighbor item for graph traversal response.
+#[derive(Debug, Clone)]
+pub struct GraphNeighbor {
+    pub edge: MemoryEdge,
+    pub node: MemoryNode,
+}
+
+/// API request for graph neighbor query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNeighborsRequest {
+    pub memory_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub mem_cube_id: Option<String>,
+    #[serde(default)]
+    pub relation: Option<String>,
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default = "default_graph_limit")]
+    pub limit: u32,
+    /// Opaque cursor token from previous response for pagination.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub include_embedding: bool,
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+fn default_graph_limit() -> u32 {
+    10
+}
+
+/// API response item for one graph neighbor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNeighborItem {
+    pub edge: MemoryEdge,
+    pub memory: MemoryItem,
+}
+
+/// API response payload for graph neighbor query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNeighborsData {
+    pub items: Vec<GraphNeighborItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// API response for graph neighbor query.
+pub type GraphNeighborsResponse = BaseResponse<GraphNeighborsData>;
+
+/// Internal shortest-path result.
+#[derive(Debug, Clone)]
+pub struct GraphPath {
+    pub node_ids: Vec<String>,
+    pub edges: Vec<MemoryEdge>,
+}
+
+/// API request for graph path query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPathRequest {
+    pub source_memory_id: String,
+    pub target_memory_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub mem_cube_id: Option<String>,
+    #[serde(default)]
+    pub relation: Option<String>,
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default = "default_graph_max_depth")]
+    pub max_depth: u32,
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+fn default_graph_max_depth() -> u32 {
+    6
+}
+
+/// API response payload for graph path query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPathData {
+    pub hops: u32,
+    pub nodes: Vec<MemoryItem>,
+    pub edges: Vec<MemoryEdge>,
+}
+
+/// API response for graph path query.
+pub type GraphPathResponse = BaseResponse<GraphPathData>;
+
+/// API request for multi-path graph query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPathsRequest {
+    pub source_memory_id: String,
+    pub target_memory_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub mem_cube_id: Option<String>,
+    #[serde(default)]
+    pub relation: Option<String>,
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default = "default_graph_max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "default_graph_top_k_paths")]
+    pub top_k_paths: u32,
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+fn default_graph_top_k_paths() -> u32 {
+    3
+}
+
+/// API response for multi-path query.
+pub type GraphPathsResponse = BaseResponse<Vec<GraphPathData>>;
+
+/// Traversal direction for graph neighbor query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphDirection {
+    Outbound,
+    Inbound,
+    Both,
+}
+
+impl Default for GraphDirection {
+    fn default() -> Self {
+        Self::Outbound
+    }
 }
 
 /// Scope for memory (MemOS: WorkingMemory, LongTermMemory, UserMemory).
