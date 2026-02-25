@@ -10,7 +10,7 @@ default = []
 qdrant = ["qdrant-client"]
 
 [dependencies]
-mem-types = { path = "../mem-types" }
+mem-types = { path = "../mem-types", version = "0.1.0" }
 async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }

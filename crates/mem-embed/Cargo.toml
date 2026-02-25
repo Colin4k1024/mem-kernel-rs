@@ -9,7 +9,7 @@ license = "Apache-2.0"
 test-util = []
 
 [dependencies]
-mem-types = { path = "../mem-types" }
+mem-types = { path = "../mem-types", version = "0.1.0" }
 async-trait = "0.1"
 thiserror = "2.0"
 reqwest = { version = "0.13", features = ["json"] }

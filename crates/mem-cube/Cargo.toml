@@ -6,10 +6,10 @@ description = "MemCube orchestration: add/search combining graph, vector, embedd
 license = "Apache-2.0"
 
 [dependencies]
-mem-types = { path = "../mem-types" }
-mem-graph = { path = "../mem-graph" }
-mem-vec = { path = "../mem-vec" }
-mem-embed = { path = "../mem-embed" }
+mem-types = { path = "../mem-types", version = "0.1.0" }
+mem-graph = { path = "../mem-graph", version = "0.1.0" }
+mem-vec = { path = "../mem-vec", version = "0.1.0" }
+mem-embed = { path = "../mem-embed", version = "0.1.0" }
 async-trait = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 serde_json = "1.0"

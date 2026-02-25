@@ -6,7 +6,7 @@ description = "Graph store trait and in-memory implementation for MemOS"
 license = "Apache-2.0"
 
 [dependencies]
-mem-types = { path = "../mem-types" }
+mem-types = { path = "../mem-types", version = "0.1.0" }
 async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }

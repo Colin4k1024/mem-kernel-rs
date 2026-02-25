@@ -10,12 +10,12 @@ name = "mem-api"
 path = "src/main.rs"
 
 [dependencies]
-mem-types = { path = "../mem-types" }
-mem-cube = { path = "../mem-cube" }
-mem-graph = { path = "../mem-graph" }
-mem-vec = { path = "../mem-vec", features = ["qdrant"] }
-mem-embed = { path = "../mem-embed" }
-mem-scheduler = { path = "../mem-scheduler" }
+mem-types = { path = "../mem-types", version = "0.1.0" }
+mem-cube = { path = "../mem-cube", version = "0.1.0" }
+mem-graph = { path = "../mem-graph", version = "0.1.0" }
+mem-vec = { path = "../mem-vec", version = "0.1.0", features = ["qdrant"] }
+mem-embed = { path = "../mem-embed", version = "0.1.0" }
+mem-scheduler = { path = "../mem-scheduler", version = "0.1.0" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
@@ -28,7 +28,7 @@ chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-mem-embed = { path = "../mem-embed", features = ["test-util"] }
+mem-embed = { path = "../mem-embed", version = "0.1.0", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 csv = "1.3"
