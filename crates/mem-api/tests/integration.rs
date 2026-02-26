@@ -1496,3 +1496,100 @@ async fn complex_dialogue_memory_returns_short_mid_long_term() {
         }));
     }
 }
+
+#[tokio::test]
+async fn hybrid_search_vector_only_returns_fused_hits() {
+    let app = test_app();
+    let add_body = json!({
+        "user_id": "hybrid_user",
+        "mem_cube_id": "hybrid_user",
+        "memory_content": "Rust is a systems programming language focused on safety.",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    let memory_id = j["data"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|d| d.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+
+    let hybrid_body = json!({
+        "user_id": "hybrid_user",
+        "mem_cube_id": "hybrid_user",
+        "query": "systems programming language",
+        "top_k": 5,
+        "mode": "vector_only"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/hybrid_search")
+        .header("content-type", "application/json")
+        .body(Body::from(hybrid_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    let data = j["data"].as_object().expect("data present");
+    assert!(data.contains_key("latency_ms"));
+    let hits = data["hits"].as_array().expect("hits array");
+    assert!(!hits.is_empty(), "expected at least one hit");
+    assert_eq!(hits[0]["memory_id"], memory_id);
+    assert!(hits[0].get("fused_score").is_some());
+}
+
+#[tokio::test]
+async fn hybrid_search_fusion_returns_channel_results() {
+    let app = test_app();
+    let add_body = json!({
+        "user_id": "fusion_user",
+        "mem_cube_id": "fusion_user",
+        "memory_content": "Meeting with the team tomorrow at 3pm.",
+        "async_mode": "sync"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/add")
+        .header("content-type", "application/json")
+        .body(Body::from(add_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let hybrid_body = json!({
+        "user_id": "fusion_user",
+        "query": "team meeting",
+        "top_k": 5,
+        "mode": "fusion"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/product/hybrid_search")
+        .header("content-type", "application/json")
+        .body(Body::from(hybrid_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["code"], 200);
+    let data = j["data"].as_object().expect("data present");
+    assert!(data.contains_key("latency_ms"));
+    assert!(data.contains_key("channel_results"));
+    let hits = data["hits"].as_array().expect("hits array");
+    if !hits.is_empty() {
+        assert!(hits[0].get("fused_score").is_some());
+    }
+}

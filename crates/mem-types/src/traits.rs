@@ -1,11 +1,11 @@
 //! Traits for MemCube and storage backends.
 
 use crate::{
-    ApiAddRequest, ApiSearchRequest, AuditEvent, AuditListOptions, ForgetMemoryRequest,
-    ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse, GraphDirection, GraphNeighbor,
-    GraphNeighborsRequest, GraphNeighborsResponse, GraphPath, GraphPathRequest, GraphPathResponse,
-    GraphPathsRequest, GraphPathsResponse, MemoryEdge, MemoryNode, MemoryResponse, SearchResponse,
-    UpdateMemoryRequest, UpdateMemoryResponse,
+    ApiAddRequest, ApiHybridSearchRequest, ApiSearchRequest, AuditEvent, AuditListOptions,
+    ForgetMemoryRequest, ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse, GraphDirection,
+    GraphNeighbor, GraphNeighborsRequest, GraphNeighborsResponse, GraphPath, GraphPathRequest,
+    GraphPathResponse, GraphPathsRequest, GraphPathsResponse, HybridSearchResponse, MemoryEdge,
+    MemoryNode, MemoryResponse, SearchResponse, UpdateMemoryRequest, UpdateMemoryResponse,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -174,6 +174,69 @@ pub struct VecStoreItem {
     pub payload: HashMap<String, serde_json::Value>,
 }
 
+/// Result of a keyword/BM25 search hit.
+#[derive(Debug, Clone)]
+pub struct KeywordSearchHit {
+    pub id: String,
+    pub score: f64,
+}
+
+/// Keyword store abstraction for BM25 search.
+#[async_trait]
+pub trait KeywordStore: Send + Sync {
+    /// Index a document (memory) by id and text for the given user/cube.
+    async fn index(
+        &self,
+        memory_id: &str,
+        text: &str,
+        user_name: Option<&str>,
+    ) -> Result<(), KeywordStoreError>;
+
+    /// Remove a document from the index.
+    async fn remove(&self, memory_id: &str, user_name: Option<&str>) -> Result<(), KeywordStoreError>;
+
+    /// Search by query string; returns top-k (id, score) for the user/cube.
+    async fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        user_name: Option<&str>,
+        filter: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<Vec<KeywordSearchHit>, KeywordStoreError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KeywordStoreError {
+    #[error("keyword store error: {0}")]
+    Other(String),
+}
+
+/// Single result from a reranker (memory id and relevance score).
+#[derive(Debug, Clone)]
+pub struct RerankHit {
+    pub memory_id: String,
+    pub score: f64,
+}
+
+/// Reranker: reorder and score a list of documents by relevance to the query.
+#[async_trait::async_trait]
+pub trait Reranker: Send + Sync {
+    /// Rerank documents; returns top_k hits in order (memory_id, score).
+    async fn rerank(
+        &self,
+        query: &str,
+        doc_ids: &[String],
+        documents: &[String],
+        top_k: u32,
+    ) -> Result<Vec<RerankHit>, RerankError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RerankError {
+    #[error("rerank error: {0}")]
+    Other(String),
+}
+
 /// Embedder: text -> vector(s).
 #[async_trait]
 pub trait Embedder: Send + Sync {
@@ -226,6 +289,15 @@ pub trait MemCube: Send + Sync {
         &self,
         req: &GraphPathsRequest,
     ) -> Result<GraphPathsResponse, MemCubeError>;
+
+    /// Hybrid search (vector + optional graph + optional keyword). Default: not supported.
+    async fn hybrid_search(
+        &self,
+        req: &ApiHybridSearchRequest,
+    ) -> Result<HybridSearchResponse, MemCubeError> {
+        let _ = req;
+        Err(MemCubeError::Other("hybrid search not supported".to_string()))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -278,4 +350,6 @@ pub enum MemCubeError {
     Graph(#[from] GraphStoreError),
     #[error("vector: {0}")]
     Vec(#[from] VecStoreError),
+    #[error("keyword: {0}")]
+    Keyword(#[from] KeywordStoreError),
 }

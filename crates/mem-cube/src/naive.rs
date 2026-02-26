@@ -6,7 +6,16 @@ use mem_graph::GraphStore;
 use mem_types::*;
 use mem_vec::VecStore;
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Candidate from merging vector/graph/keyword channel hits (id + per-channel scores).
+struct HybridCandidate {
+    id: String,
+    vector_score: Option<f64>,
+    graph_score: Option<f64>,
+    keyword_score: Option<f64>,
+}
 
 /// MemCube that composes a graph store, vector store, and embedder for add/search.
 pub struct NaiveMemCube<G, V, E> {
@@ -15,6 +24,10 @@ pub struct NaiveMemCube<G, V, E> {
     pub embedder: E,
     /// Default scope for new memories (e.g. LongTermMemory).
     pub default_scope: String,
+    /// Optional keyword store for BM25 channel in hybrid search.
+    pub keyword_store: Option<Arc<dyn KeywordStore + Send + Sync>>,
+    /// Optional reranker for hybrid search.
+    pub reranker: Option<Arc<dyn Reranker + Send + Sync>>,
 }
 
 impl<G, V, E> NaiveMemCube<G, V, E>
@@ -29,7 +42,21 @@ where
             vec_store,
             embedder,
             default_scope: "LongTermMemory".to_string(),
+            keyword_store: None,
+            reranker: None,
         }
+    }
+
+    /// Attach an optional reranker for hybrid search.
+    pub fn with_reranker(mut self, reranker: Option<Arc<dyn Reranker + Send + Sync>>) -> Self {
+        self.reranker = reranker;
+        self
+    }
+
+    /// Attach an optional keyword store for hybrid search BM25 channel.
+    pub fn with_keyword_store(mut self, keyword_store: Option<Arc<dyn KeywordStore + Send + Sync>>) -> Self {
+        self.keyword_store = keyword_store;
+        self
     }
 
     fn node_owner(metadata: &HashMap<String, serde_json::Value>) -> &str {
@@ -92,6 +119,89 @@ where
             "LongTermMemory" => Some("long_term"),
             _ => None,
         }
+    }
+
+    /// Merge channel hits into deduplicated candidates and build channel_results.
+    fn merge_hybrid_candidates(
+        vector_hits: &[VecSearchHit],
+        graph_hits: &[VecSearchHit],
+        keyword_hits: &[(String, f64)],
+    ) -> (
+        Vec<HybridCandidate>,
+        Vec<ChannelResult>,
+    ) {
+        use std::collections::HashMap;
+        let mut by_id: HashMap<String, HybridCandidate> = HashMap::new();
+        for h in vector_hits {
+            by_id
+                .entry(h.id.clone())
+                .or_insert_with(|| HybridCandidate {
+                    id: h.id.clone(),
+                    vector_score: None,
+                    graph_score: None,
+                    keyword_score: None,
+                })
+                .vector_score = Some(h.score);
+        }
+        for h in graph_hits {
+            by_id
+                .entry(h.id.clone())
+                .or_insert_with(|| HybridCandidate {
+                    id: h.id.clone(),
+                    vector_score: None,
+                    graph_score: None,
+                    keyword_score: None,
+                })
+                .graph_score = Some(h.score);
+        }
+        for (id, score) in keyword_hits {
+            by_id
+                .entry(id.clone())
+                .or_insert_with(|| HybridCandidate {
+                    id: id.clone(),
+                    vector_score: None,
+                    graph_score: None,
+                    keyword_score: None,
+                })
+                .keyword_score = Some(*score);
+        }
+        let candidates: Vec<HybridCandidate> = by_id.into_values().collect();
+        let channel_results = vec![
+            ChannelResult {
+                channel: SearchChannel::Vector,
+                count: vector_hits.len() as u32,
+                hits: vec![],
+            },
+            ChannelResult {
+                channel: SearchChannel::Graph,
+                count: graph_hits.len() as u32,
+                hits: vec![],
+            },
+            ChannelResult {
+                channel: SearchChannel::Keyword,
+                count: keyword_hits.len() as u32,
+                hits: vec![],
+            },
+        ];
+        (candidates, channel_results)
+    }
+
+    fn channels_for_scores(
+        v: Option<f64>,
+        g: Option<f64>,
+        k: Option<f64>,
+    ) -> Vec<SearchChannel> {
+        let mut ch = vec![];
+        if v.is_some() {
+            ch.push(SearchChannel::Vector);
+        }
+        if g.is_some() {
+            ch.push(SearchChannel::Graph);
+        }
+        if k.is_some() {
+            ch.push(SearchChannel::Keyword);
+        }
+        ch
     }
 }
 
@@ -238,6 +348,14 @@ where
             return Err(MemCubeError::Vec(e));
         }
 
+        if let Some(ref kw) = self.keyword_store {
+            if let Err(e) = kw.index(&id, &content, Some(user_name)).await {
+                let _ = self.vec_store.delete(&[id.clone()], None).await;
+                let _ = self.graph.delete_node(&id, Some(user_name)).await;
+                return Err(MemCubeError::Keyword(e));
+            }
+        }
+
         let data = vec![serde_json::json!({ "id": id, "memory": content })];
         Ok(MemoryResponse {
             code: 200,
@@ -363,6 +481,230 @@ where
         })
     }
 
+    async fn hybrid_search(
+        &self,
+        req: &ApiHybridSearchRequest,
+    ) -> Result<HybridSearchResponse, MemCubeError> {
+        let start = std::time::Instant::now();
+        let cube_ids = req.readable_cube_ids();
+        let user_name = cube_ids.first().map(String::as_str).unwrap_or(&req.user_id);
+        let top_k = req.top_k as usize;
+        let mut filter = std::collections::HashMap::new();
+        filter.insert(
+            "mem_cube_id".to_string(),
+            serde_json::Value::String(user_name.to_string()),
+        );
+
+        let query_vector = self.embedder.embed(&req.query).await?;
+
+        let keyword_enabled = self.keyword_store.is_some()
+            && req.keyword_config.as_ref().map(|c| c.enabled).unwrap_or(true);
+
+        let (vector_hits, graph_hits, keyword_hits): (
+            Vec<VecSearchHit>,
+            Vec<VecSearchHit>,
+            Vec<KeywordSearchHit>,
+        ) = match req.mode {
+            HybridSearchMode::VectorOnly => {
+                let v = self
+                    .vec_store
+                    .search(&query_vector, top_k, Some(&filter), None)
+                    .await
+                    .map_err(MemCubeError::Vec)?;
+                (v, vec![], vec![])
+            }
+            HybridSearchMode::GraphOnly => {
+                let g = self
+                    .graph
+                    .search_by_embedding(&query_vector, top_k, Some(user_name))
+                    .await
+                    .map_err(MemCubeError::Graph)?;
+                (vec![], g, vec![])
+            }
+            HybridSearchMode::KeywordOnly => {
+                let kw = self
+                    .keyword_store
+                    .as_ref()
+                    .ok_or_else(|| MemCubeError::Other("keyword-only search requires keyword store".to_string()))?;
+                let k = kw
+                    .search(&req.query, top_k, Some(user_name), Some(&filter))
+                    .await?;
+                (vec![], vec![], k)
+            }
+            HybridSearchMode::Fusion | HybridSearchMode::Custom => {
+                if keyword_enabled {
+                    let kw = self.keyword_store.as_ref().unwrap();
+                    let (v_res, g_res, k_res) = tokio::join!(
+                        self.vec_store.search(&query_vector, top_k, Some(&filter), None),
+                        self.graph.search_by_embedding(&query_vector, top_k, Some(user_name)),
+                        kw.search(&req.query, top_k, Some(user_name), Some(&filter)),
+                    );
+                    let v = v_res.map_err(MemCubeError::Vec)?;
+                    let g = g_res.map_err(MemCubeError::Graph)?;
+                    let k = k_res?;
+                    (v, g, k)
+                } else {
+                    let (v_res, g_res) = tokio::join!(
+                        self.vec_store.search(&query_vector, top_k, Some(&filter), None),
+                        self.graph.search_by_embedding(&query_vector, top_k, Some(user_name)),
+                    );
+                    let v = v_res.map_err(MemCubeError::Vec)?;
+                    let g = g_res.map_err(MemCubeError::Graph)?;
+                    (v, g, vec![])
+                }
+            }
+        };
+
+        let kw_pairs: Vec<(String, f64)> = keyword_hits
+            .iter()
+            .map(|h| (h.id.clone(), h.score))
+            .collect();
+        let (candidates, channel_results) = Self::merge_hybrid_candidates(
+            &vector_hits,
+            &graph_hits,
+            &kw_pairs,
+        );
+
+        if candidates.is_empty() {
+            let latency_ms = start.elapsed().as_millis() as u64;
+            return Ok(HybridSearchResponse {
+                code: 200,
+                message: "Hybrid search completed successfully".to_string(),
+                data: Some(HybridSearchData {
+                    query: req.query.clone(),
+                    total_candidates: 0,
+                    hits: vec![],
+                    channel_results,
+                    rerank_used: false,
+                    latency_ms,
+                }),
+            });
+        }
+
+        let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+        let nodes = self
+            .graph
+            .get_nodes(&ids, false)
+            .await
+            .map_err(MemCubeError::Graph)?;
+
+        let score_map: std::collections::HashMap<String, (Option<f64>, Option<f64>, Option<f64>)> =
+            candidates
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        (c.vector_score, c.graph_score, c.keyword_score),
+                    )
+                })
+                .collect();
+
+        let max_keyword = candidates
+            .iter()
+            .filter_map(|c| c.keyword_score)
+            .fold(0.0f64, |a, b| a.max(b));
+        let keyword_scale = if max_keyword > 0.0 { max_keyword } else { 1.0 };
+
+        let weights = req
+            .fusion_weights
+            .as_ref()
+            .map(|w| (w.vector_weight, w.keyword_weight, w.graph_weight))
+            .unwrap_or((0.6, 0.3, 0.1));
+
+        let mut hits: Vec<HybridSearchHit> = nodes
+            .into_iter()
+            .filter(|n| {
+                n.metadata
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("active")
+                    != "tombstone"
+            })
+            .filter_map(|n| {
+                let scores = score_map.get(&n.id)?;
+                let v_norm = scores.0.unwrap_or(0.0);
+                let g_norm = scores.1.unwrap_or(0.0);
+                let k_raw = scores.2.unwrap_or(0.0);
+                let k_norm = if keyword_scale > 0.0 { k_raw / keyword_scale } else { k_raw };
+                let fused = weights.0 * v_norm + weights.1 * k_norm + weights.2 * g_norm;
+                Some(HybridSearchHit {
+                    memory_id: n.id.clone(),
+                    memory_content: n.memory.clone(),
+                    metadata: n.metadata.clone(),
+                    vector_score: scores.0,
+                    keyword_score: scores.2,
+                    graph_score: scores.1,
+                    fused_score: fused,
+                    vector_norm: scores.0,
+                    keyword_norm: scores.2.map(|_| k_norm),
+                    graph_norm: scores.1,
+                    rerank_score: None,
+                    channels: Self::channels_for_scores(scores.0, scores.1, scores.2),
+                })
+            })
+            .collect();
+
+        hits.sort_by(|a, b| b.fused_score.partial_cmp(&a.fused_score).unwrap_or(std::cmp::Ordering::Equal));
+        let total_candidates = hits.len();
+
+        let (mut hits, rerank_used) = if let (Some(ref reranker), Some(ref rcfg)) =
+            (self.reranker.as_ref(), req.rerank_config.as_ref())
+        {
+            if rcfg.enabled && rcfg.model_url.is_some() && !hits.is_empty() {
+                let rerank_top_k = rcfg.rerank_top_k as usize;
+                let take = (rerank_top_k * 2).min(hits.len());
+                let candidates: Vec<_> = hits.iter().take(take).cloned().collect();
+                let ids: Vec<String> = candidates.iter().map(|h| h.memory_id.clone()).collect();
+                let docs: Vec<String> = candidates.iter().map(|h| h.memory_content.clone()).collect();
+                match reranker
+                    .rerank(&req.query, &ids, &docs, rcfg.rerank_top_k)
+                    .await
+                {
+                    Ok(reranked) if !reranked.is_empty() => {
+                        let id_to_hit: std::collections::HashMap<_, _> = candidates
+                            .into_iter()
+                            .map(|h| (h.memory_id.clone(), h))
+                            .collect();
+                        let mut out: Vec<HybridSearchHit> = reranked
+                            .into_iter()
+                            .filter_map(|r| {
+                                let mut h = id_to_hit.get(&r.memory_id)?.clone();
+                                h.rerank_score = Some(r.score);
+                                Some(h)
+                            })
+                            .collect();
+                        out.truncate(top_k);
+                        (out, true)
+                    }
+                    _ => {
+                        hits.truncate(top_k);
+                        (hits, false)
+                    }
+                }
+            } else {
+                hits.truncate(top_k);
+                (hits, false)
+            }
+        } else {
+            hits.truncate(top_k);
+            (hits, false)
+        };
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(HybridSearchResponse {
+            code: 200,
+            message: "Hybrid search completed successfully".to_string(),
+            data: Some(HybridSearchData {
+                query: req.query.clone(),
+                total_candidates: total_candidates as u32,
+                hits,
+                channel_results,
+                rerank_used,
+                latency_ms,
+            }),
+        })
+    }
+
     async fn update_memory(
         &self,
         req: &UpdateMemoryRequest,
@@ -478,6 +820,14 @@ where
                 .map_err(MemCubeError::Vec)?;
         }
 
+        if let Some(ref kw) = self.keyword_store {
+            let content = req
+                .memory
+                .as_deref()
+                .unwrap_or(&node.memory);
+            let _ = kw.index(id, content, Some(user_name)).await;
+        }
+
         let data = vec![serde_json::json!({ "id": id, "updated": true })];
         Ok(UpdateMemoryResponse {
             code: 200,
@@ -532,6 +882,9 @@ where
                 .delete(&[id.to_string()], None)
                 .await
                 .map_err(MemCubeError::Vec)?;
+        }
+        if let Some(ref kw) = self.keyword_store {
+            let _ = kw.remove(id, Some(user_name)).await;
         }
         let data = vec![serde_json::json!({ "id": id, "forgotten": true })];
         Ok(ForgetMemoryResponse {

@@ -13,11 +13,12 @@ use axum::{
 use mem_scheduler::Scheduler;
 use mem_types::MemCube;
 use mem_types::{
-    ApiAddRequest, ApiSearchRequest, AuditEvent, AuditEventKind, AuditListOptions, AuditStore,
-    ForgetMemoryRequest, ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse,
-    GraphNeighborsRequest, GraphNeighborsResponse, GraphPathRequest, GraphPathResponse,
-    GraphPathsRequest, GraphPathsResponse, MemCubeError, MemoryResponse, SchedulerStatusResponse,
-    SearchResponse, UpdateMemoryRequest, UpdateMemoryResponse,
+    ApiAddRequest, ApiHybridSearchRequest, ApiSearchRequest, AuditEvent, AuditEventKind,
+    AuditListOptions, AuditStore, Entity, EntityRelationType, EntityType, ForgetMemoryRequest,
+    ForgetMemoryResponse, GetMemoryRequest, GetMemoryResponse, GraphNeighborsRequest,
+    GraphNeighborsResponse, GraphPathRequest, GraphPathResponse, GraphPathsRequest,
+    GraphPathsResponse, HybridSearchResponse, MemCubeError, MemoryResponse,
+    SchedulerStatusResponse, SearchResponse, UpdateMemoryRequest, UpdateMemoryResponse,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -27,6 +28,12 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
+
+// Re-export entity types for use in routes
+pub use mem_types::{
+    Entity as EntityType_, EntityRelationType as EntityRelationType_,
+    EntityType as EntityTypeEnum,
+};
 
 /// In-memory implementation of AuditStore (process lifetime only).
 pub struct InMemoryAuditStore {
@@ -340,6 +347,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let product_routes = Router::new()
         .route("/product/add", post(handle_add))
         .route("/product/search", post(handle_search))
+        .route("/product/hybrid_search", post(handle_hybrid_search))
         .route("/product/scheduler/status", get(handle_scheduler_status))
         .route("/product/update_memory", post(handle_update_memory))
         .route("/product/delete_memory", post(handle_delete_memory))
@@ -525,6 +533,38 @@ async fn handle_search(
             message: e.to_string(),
             data: None,
         }),
+    }
+}
+
+async fn handle_hybrid_search(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ApiHybridSearchRequest>,
+) -> (StatusCode, Json<HybridSearchResponse>) {
+    match state.cube.hybrid_search(&req).await {
+        Ok(res) => (StatusCode::OK, Json(res)),
+        Err(e) => {
+            let msg = e.to_string();
+            let (code, response) = if msg.contains("not supported") {
+                (
+                    StatusCode::NOT_IMPLEMENTED,
+                    HybridSearchResponse {
+                        code: 501,
+                        message: msg,
+                        data: None,
+                    },
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    HybridSearchResponse {
+                        code: 500,
+                        message: msg,
+                        data: None,
+                    },
+                )
+            };
+            (code, Json(response))
+        }
     }
 }
 
@@ -841,4 +881,150 @@ async fn handle_metrics() -> impl IntoResponse {
         metrics().render_prometheus(),
     )
         .into_response()
+}
+
+// ============================================================================
+// Entity Routes (Simplified - require EntityAwareMemCube)
+// ============================================================================
+
+/// Get entity by ID request.
+#[derive(Debug, Deserialize)]
+pub struct GetEntityRequest {
+    pub entity_id: String,
+}
+
+/// Get entity by name request.
+#[derive(Debug, Deserialize)]
+pub struct GetEntityByNameRequest {
+    pub name: String,
+}
+
+/// Search entities request.
+#[derive(Debug, Deserialize)]
+pub struct SearchEntitiesRequest {
+    pub query: String,
+    #[serde(default)]
+    pub entity_type: Option<EntityType>,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub fuzzy: bool,
+}
+
+fn default_limit() -> u32 {
+    20
+}
+
+/// List entities by type request.
+#[derive(Debug, Deserialize)]
+pub struct ListEntitiesByTypeRequest {
+    pub entity_type: EntityType,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Get entity relations request.
+#[derive(Debug, Deserialize)]
+pub struct GetEntityRelationsRequest {
+    pub entity_id: String,
+    #[serde(default)]
+    pub relation_type: Option<EntityRelationType>,
+    #[serde(default = "default_related_limit")]
+    pub limit: u32,
+}
+
+fn default_related_limit() -> u32 {
+    20
+}
+
+/// Get entities for memory request.
+#[derive(Debug, Deserialize)]
+pub struct GetMemoryEntitiesRequest {
+    pub memory_id: String,
+}
+
+/// Entity response.
+#[derive(Debug, serde::Serialize)]
+pub struct EntityApiResponse {
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Entity list response.
+#[derive(Debug, serde::Serialize)]
+pub struct EntityListApiResponse {
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub entities: Vec<serde_json::Value>,
+    pub total_count: u32,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Entity relations response.
+#[derive(Debug, serde::Serialize)]
+pub struct EntityRelationsApiResponse {
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub relations: Vec<RelationItem>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct RelationItem {
+    pub relation_type: String,
+    pub entity: EntityItem,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct EntityItem {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub attributes: Option<serde_json::Value>,
+    pub occurrence_count: u32,
+    pub confidence: f64,
+}
+
+/// Entity stats response.
+#[derive(Debug, serde::Serialize)]
+pub struct EntityStatsApiResponse {
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<EntityStatsData>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct EntityStatsData {
+    pub total_entities: u32,
+    pub total_relations: u32,
+    #[serde(default)]
+    pub type_counts: serde_json::Value,
+}
+
+/// Convert internal Entity to API format.
+fn entity_to_api(entity: &Entity) -> serde_json::Value {
+    serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "entity_type": entity.entity_type.to_string(),
+        "description": entity.description,
+        "attributes": entity.attributes,
+        "memory_ids": entity.memory_ids,
+        "name_variants": entity.name_variants,
+        "occurrence_count": entity.metadata.occurrence_count,
+        "confidence": entity.metadata.confidence,
+        "first_seen": entity.metadata.first_seen,
+        "last_updated": entity.metadata.last_updated,
+        "version": entity.version,
+    })
 }

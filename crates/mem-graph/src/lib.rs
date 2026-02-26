@@ -2,6 +2,7 @@
 
 mod memory;
 mod store;
+mod entity_knowledge_graph;
 
 pub use mem_types::{
     GraphDirection, GraphNeighbor, GraphPath, GraphStoreError, MemoryEdge, MemoryNode,
@@ -9,3 +10,6 @@ pub use mem_types::{
 };
 pub use memory::InMemoryGraphStore;
 pub use store::GraphStore;
+pub use entity_knowledge_graph::{
+    EntityKgError, EntityKgSnapshot, EntityKgStats, EntityKnowledgeGraph,
+};

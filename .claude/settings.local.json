@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check --all)",
+      "Bash(cargo check --package mem-embed)"
+    ]
+  }
+}

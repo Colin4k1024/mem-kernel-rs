@@ -1,5 +1,6 @@
 //! Vector store trait with in-memory and Qdrant implementations.
 
+mod keyword_store;
 mod memory_vec;
 mod store;
 
@@ -7,6 +8,7 @@ mod store;
 mod qdrant_store;
 
 pub use mem_types::{VecSearchHit, VecStoreError, VecStoreItem};
+pub use keyword_store::InMemoryKeywordStore;
 pub use memory_vec::InMemoryVecStore;
 #[cfg(feature = "qdrant")]
 pub use qdrant_store::QdrantVecStore;

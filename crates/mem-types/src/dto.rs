@@ -3,6 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::{
+    EntityRelationType, EntityType, FusionWeights, GraphSearchConfig, HybridSearchMode,
+    KeywordSearchConfig, RerankConfig, SearchChannel,
+};
+
 /// Single chat message (user/assistant).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -411,4 +416,279 @@ impl std::fmt::Display for MemoryScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+// ============================================================================
+// Hybrid Search API Types (Phase 6)
+// ============================================================================
+
+/// Hybrid search request combining vector, keyword, and graph channels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiHybridSearchRequest {
+    /// User ID for authorization.
+    pub user_id: String,
+    /// Cube IDs to search in.
+    #[serde(default)]
+    pub readable_cube_ids: Option<Vec<String>>,
+    /// Query text for search.
+    pub query: String,
+    /// Number of results to return.
+    #[serde(default = "default_top_k")]
+    pub top_k: u32,
+    /// Score threshold filter (0.0 - 1.0).
+    #[serde(default)]
+    pub relativity: Option<f64>,
+    /// Search mode.
+    #[serde(default)]
+    pub mode: HybridSearchMode,
+    /// Weights for score fusion.
+    #[serde(default)]
+    pub fusion_weights: Option<FusionWeights>,
+    /// Keyword search configuration.
+    #[serde(default)]
+    pub keyword_config: Option<KeywordSearchConfig>,
+    /// Graph search configuration.
+    #[serde(default)]
+    pub graph_config: Option<GraphSearchConfig>,
+    /// Reranking configuration.
+    #[serde(default)]
+    pub rerank_config: Option<RerankConfig>,
+}
+
+impl ApiHybridSearchRequest {
+    /// Get searchable cube IDs.
+    pub fn readable_cube_ids(&self) -> Vec<String> {
+        if let Some(ref ids) = self.readable_cube_ids {
+            if !ids.is_empty() {
+                return ids.clone();
+            }
+        }
+        vec![self.user_id.clone()]
+    }
+}
+
+/// Result from a single search channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelResult {
+    /// Channel type.
+    pub channel: SearchChannel,
+    /// Number of results from this channel.
+    pub count: u32,
+    /// Raw hits from this channel.
+    #[serde(default)]
+    pub hits: Vec<serde_json::Value>,
+}
+
+/// A single hit from hybrid search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchHit {
+    /// Memory ID.
+    pub memory_id: String,
+    /// Memory content.
+    pub memory_content: String,
+    /// Memory metadata.
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+    /// Vector similarity score (raw).
+    #[serde(default)]
+    pub vector_score: Option<f64>,
+    /// Keyword/BM25 score (raw).
+    #[serde(default)]
+    pub keyword_score: Option<f64>,
+    /// Graph score (raw).
+    #[serde(default)]
+    pub graph_score: Option<f64>,
+    /// Fused normalized score (0.0 - 1.0).
+    pub fused_score: f64,
+    /// Normalized vector score.
+    #[serde(default)]
+    pub vector_norm: Option<f64>,
+    /// Normalized keyword score.
+    #[serde(default)]
+    pub keyword_norm: Option<f64>,
+    /// Normalized graph score.
+    #[serde(default)]
+    pub graph_norm: Option<f64>,
+    /// Rerank score (if enabled).
+    #[serde(default)]
+    pub rerank_score: Option<f64>,
+    /// Source channels that contributed to this hit.
+    #[serde(default)]
+    pub channels: Vec<SearchChannel>,
+}
+
+/// Hybrid search response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchResponse {
+    #[serde(default = "default_code")]
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<HybridSearchData>,
+}
+
+impl Default for HybridSearchResponse {
+    fn default() -> Self {
+        Self {
+            code: 200,
+            message: String::new(),
+            data: None,
+        }
+    }
+}
+
+/// Hybrid search data payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchData {
+    /// Original query.
+    pub query: String,
+    /// Total hits before reranking.
+    pub total_candidates: u32,
+    /// Final hits after fusion/reranking.
+    pub hits: Vec<HybridSearchHit>,
+    /// Results from individual channels.
+    #[serde(default)]
+    pub channel_results: Vec<ChannelResult>,
+    /// Whether reranking was applied.
+    pub rerank_used: bool,
+    /// Processing latency in milliseconds.
+    pub latency_ms: u64,
+}
+
+/// Entity search request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchEntitiesRequest {
+    /// Search query.
+    pub query: String,
+    /// Filter by entity type.
+    #[serde(default)]
+    pub entity_type: Option<EntityType>,
+    /// Maximum results to return.
+    #[serde(default = "default_entity_limit")]
+    pub limit: u32,
+    /// Enable fuzzy matching.
+    #[serde(default)]
+    pub fuzzy: bool,
+}
+
+fn default_entity_limit() -> u32 {
+    20
+}
+
+/// Get entity by ID request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetEntityRequest {
+    pub entity_id: String,
+}
+
+/// List entities by type request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListEntitiesByTypeRequest {
+    pub entity_type: EntityType,
+    #[serde(default = "default_entity_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Entity search response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchEntitiesResponse {
+    #[serde(default = "default_code")]
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<SearchEntitiesData>,
+}
+
+/// Entity search result data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchEntitiesData {
+    /// Matching entities.
+    pub entities: Vec<serde_json::Value>,
+    /// Total count.
+    pub total_count: u32,
+    /// Optional cursor for pagination.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Entity-aware search request (search memories by entity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityAwareSearchRequest {
+    /// Entity name to search for.
+    pub entity_name: String,
+    /// Filter by entity type.
+    #[serde(default)]
+    pub entity_type: Option<EntityType>,
+    /// User ID.
+    pub user_id: String,
+    /// Cube IDs.
+    #[serde(default)]
+    pub readable_cube_ids: Option<Vec<String>>,
+    /// Maximum memories per entity.
+    #[serde(default = "default_memories_per_entity")]
+    pub memories_per_entity: u32,
+    /// Maximum total results.
+    #[serde(default = "default_entity_search_limit")]
+    pub limit: u32,
+}
+
+fn default_memories_per_entity() -> u32 {
+    5
+}
+
+fn default_entity_search_limit() -> u32 {
+    50
+}
+
+/// Get entity relations request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetEntityRelationsRequest {
+    pub entity_id: String,
+    /// Filter by relation type.
+    #[serde(default)]
+    pub relation_type: Option<EntityRelationType>,
+    /// Maximum related entities to return.
+    #[serde(default = "default_related_limit")]
+    pub limit: u32,
+}
+
+fn default_related_limit() -> u32 {
+    20
+}
+
+/// Batch hybrid search request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchHybridSearchRequest {
+    pub user_id: String,
+    #[serde(default)]
+    pub readable_cube_ids: Option<Vec<String>>,
+    /// List of queries.
+    pub queries: Vec<String>,
+    #[serde(default = "default_top_k")]
+    pub top_k: u32,
+    #[serde(default)]
+    pub mode: HybridSearchMode,
+    #[serde(default)]
+    pub fusion_weights: Option<FusionWeights>,
+}
+
+/// Response for batch hybrid search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchHybridSearchResponse {
+    #[serde(default = "default_code")]
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<BatchHybridSearchData>,
+}
+
+/// Batch search result data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchHybridSearchData {
+    /// Results per query.
+    pub results: Vec<HybridSearchData>,
+    /// Total processing time.
+    pub total_latency_ms: u64,
 }
