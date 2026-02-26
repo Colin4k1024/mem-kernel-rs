@@ -477,8 +477,7 @@ impl GraphStore for SqliteGraphStore {
             let rows = stmt.query_map([], |row| {
                 let metadata_json: String = row.get(2)?;
                 let embedding_blob: Option<Vec<u8>> = row.get(3)?;
-                let embedding = embedding_blob
-                    .and_then(|b| serde_json::from_slice(&b).ok());
+                let embedding = embedding_blob.and_then(|b| serde_json::from_slice(&b).ok());
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
