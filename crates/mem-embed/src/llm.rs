@@ -37,6 +37,7 @@ struct ChatCompletionRequest {
 
 /// Response from LLM chat completion.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
     usage: Option<Usage>,
@@ -53,6 +54,7 @@ struct ResponseMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Usage {
     #[serde(rename = "prompt_tokens")]
     prompt_tokens: Option<u32>,
