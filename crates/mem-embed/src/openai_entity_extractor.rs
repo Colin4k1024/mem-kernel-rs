@@ -243,10 +243,7 @@ impl EntityExtractor for OpenAiEntityExtractor {
 
         // Apply filters
         filter_by_confidence(&mut entities, config.min_confidence);
-        filter_by_types(
-            &mut entities,
-            config.target_types.as_deref(),
-        );
+        filter_by_types(&mut entities, config.target_types.as_deref());
 
         if config.enable_deduplication {
             deduplicate_entities(&mut entities);

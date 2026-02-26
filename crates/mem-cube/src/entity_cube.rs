@@ -244,7 +244,8 @@ where
 
                 tokio::spawn(async move {
                     if let Some(ref extractor) = extractor {
-                        if let Ok(result) = extractor.extract(&content, config.extraction_config).await
+                        if let Ok(result) =
+                            extractor.extract(&content, config.extraction_config).await
                         {
                             let kg = kg.lock().await;
                             for entity in result
