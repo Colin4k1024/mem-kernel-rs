@@ -18,5 +18,5 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 qdrant-client = { version = "1.9", optional = true }
-rusqlite = { version = "0.31", optional = true }
+rusqlite = { version = "0.38", optional = true }
 chrono = { version = "0.4", optional = true }
